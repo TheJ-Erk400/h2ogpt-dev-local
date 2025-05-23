@@ -1,12 +1,12 @@
 import ast
 import asyncio
-import base64
+import selectors
 import contextlib
 import functools
 import gc
-import getpass
 import hashlib
 import inspect
+import io
 import json
 import os
 import pathlib
@@ -34,6 +34,7 @@ import filelock
 import fire
 import numpy as np
 import pandas as pd
+import psutil
 import requests
 import uuid
 import re
@@ -717,7 +718,8 @@ def download_simple(url, dest=None, overwrite=False, verbose=False):
 
     if os.path.isfile(dest):
         if not overwrite:
-            print("Already have %s from url %s, delete file if invalid" % (dest, str(url)), flush=True)
+            if verbose:
+                print("Already have %s from url %s, delete file if invalid" % (dest, str(url)), flush=True)
             return dest
         else:
             remove(dest)
@@ -891,7 +893,7 @@ def get_url(x, from_str=False, short_name=False, font_size=2):
         return """<font size="%s"><a href="%s" target="_blank"  rel="noopener noreferrer">%s</a></font>""" % (
             font_size, source, source_name)
     elif '<a href=' not in source:
-        return """<font size="%s"><a href="file/%s" target="_blank"  rel="noopener noreferrer">%s</a></font>""" % (
+        return """<font size="%s"><a href="file:///%s" target="_blank"  rel="noopener noreferrer">%s</a></font>""" % (
             font_size, source, source_name)
     else:
         # already filled
@@ -1536,7 +1538,7 @@ except (PackageNotFoundError, AssertionError):
 have_pymupdf4llm = False
 try:
     assert distribution('pymupdf4llm') is not None
-    have_pymupdf4llm = True
+    have_pymupdf4llm = False  # too slow, avoid for now
 except (PackageNotFoundError, AssertionError):
     pass
 
@@ -1796,7 +1798,7 @@ def get_model_name(model_name, openai_client):
             print("Too few or too many models in list so do not know which to chose: given: %s list: %s" % (
                 model_name, model_names))
     except Exception as e:
-        print("Failed to get model name from OpenAI client, using default", e)
+        print(f"Failed to get model name from OpenAI client, using default {model_name}: {str(e)}")
     return model_name
 
 
@@ -2011,103 +2013,9 @@ def lg_to_gr(
         url_loaders_options0, url_loaders_options
 
 
-def fix_json(s):
-    # Attempt to parse the string as-is.
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        pass
-
-    # Initialize variables.
-    new_s = ""
-    stack = []
-    is_inside_string = False
-    escaped = False
-
-    # Process each character in the string one at a time.
-    for char in s:
-        if is_inside_string:
-            if char == '"' and not escaped:
-                is_inside_string = False
-            elif char == '\n' and not escaped:
-                char = '\\n'  # Replace the newline character with the escape sequence.
-            elif char == '\\':
-                escaped = not escaped
-            else:
-                escaped = False
-        else:
-            if char == '"':
-                is_inside_string = True
-                escaped = False
-            elif char == '{':
-                stack.append('}')
-            elif char == '[':
-                stack.append(']')
-            elif char == '}' or char == ']':
-                if stack and stack[-1] == char:
-                    stack.pop()
-                else:
-                    # Mismatched closing character; the input is malformed.
-                    return None
-
-        # Append the processed character to the new string.
-        new_s += char
-
-    # If we're still inside a string at the end of processing, we need to close the string.
-    if is_inside_string:
-        new_s += '"'
-
-    # Close any remaining open structures in the reverse order that they were opened.
-    for closing_char in reversed(stack):
-        new_s += closing_char
-
-    # Attempt to parse the modified string as JSON.
-    try:
-        return json.loads(new_s)
-    except json.JSONDecodeError:
-        # If we still can't parse the string as JSON, return None to indicate failure.
-        return None
-
-
-def wrap_in_try_except(code):
-    # Add import traceback
-    code = "import traceback\n" + code
-
-    # Parse the input code into an AST
-    parsed_code = ast.parse(code)
-
-    # Wrap the entire code's AST in a single try-except block
-    try_except = ast.Try(
-        body=parsed_code.body,
-        handlers=[
-            ast.ExceptHandler(
-                type=ast.Name(id="Exception", ctx=ast.Load()),
-                name=None,
-                body=[
-                    ast.Expr(
-                        value=ast.Call(
-                            func=ast.Attribute(value=ast.Name(id="traceback", ctx=ast.Load()), attr="print_exc",
-                                               ctx=ast.Load()),
-                            args=[],
-                            keywords=[]
-                        )
-                    ),
-                ]
-            )
-        ],
-        orelse=[],
-        finalbody=[]
-    )
-
-    # Assign the try-except block as the new body
-    parsed_code.body = [try_except]
-
-    # Convert the modified AST back to source code
-    return ast.unparse(parsed_code)
-
-
 def enqueue_output(file, queue):
-    for line in iter(file.readline, ''):
+    # for line in iter(file.readline, ''):
+    for line in iter(file.readline, b'' if isinstance(file, io.BufferedReader) else ''):
         queue.put(line)
     file.close()
 
@@ -2120,7 +2028,6 @@ def read_popen_pipes(p):
         pool.submit(enqueue_output, p.stderr, q_stderr)
 
         while True:
-
             if p.poll() is not None and q_stdout.empty() and q_stderr.empty():
                 break
 
@@ -2146,6 +2053,136 @@ def start_process(cmd):
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     for c in iter(lambda: process.stdout.read(1), b''):
         sys.stdout.write(c)
+
+
+def execute_cmd_stream(cmd=None, script_content=None, cwd=None, env=None, timeout=None, capture_output=True,
+                       text=True, print_tags=False, print_literal=True, print_func=print,
+                       guard_func=None, sleep=0.05,
+                       max_stream_length=4096, max_memory_usage=16*1024**3):
+    if script_content is None and cmd is None:
+        raise ValueError("Either script_content or cmd must be provided")
+
+    if script_content is not None:
+        script_path = 'temp_script.py'
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        cmd = [sys.executable, script_path]
+    else:
+        script_path = None
+        assert cmd, "cmd must be provided if script_content is None"
+
+    length = 0
+    try:
+        # Prepare Popen arguments
+        popen_kwargs = {
+            'cwd': cwd,
+            'env': env,
+            'bufsize': 1,  # Line-buffered
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.PIPE,
+            'universal_newlines': text,
+        }
+
+        with subprocess.Popen(cmd, **popen_kwargs) as p:
+            # Start psutil process to monitor memory usage
+            psutil_process = psutil.Process(p.pid)
+
+            sel = selectors.DefaultSelector()
+            sel.register(p.stdout, selectors.EVENT_READ)
+            sel.register(p.stderr, selectors.EVENT_READ)
+
+            stdout_data = []
+            stderr_data = []
+
+            start_time = time.time()
+
+            while True:
+                if timeout and time.time() - start_time > timeout:
+                    p.terminate()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+
+                # Monitor memory usage for the main process and all its children
+                if max_memory_usage:
+                    measure_t0 = time.time()
+                    try:
+                        # Get memory usage of the main process and its children
+                        mem_info = psutil_process.memory_info().rss
+                        children = psutil_process.children(recursive=True)
+                        for child in children:
+                            mem_info += child.memory_info().rss
+                    except psutil.NoSuchProcess:
+                        mem_info = 0
+
+                    # Check if the total memory usage exceeds the limit
+                    if mem_info > max_memory_usage:
+                        try:
+                            p.terminate()
+                        except Exception as e:
+                            print(f"Error terminating process: {e}")
+                        try:
+                            p.kill()
+                        except Exception as e:
+                            print(f"Error killing process: {e}")
+                        error = f"Process and its children used memory {mem_info} that exceeded memory limit of {max_memory_usage} bytes detected in {time.time() - measure_t0}."
+                        stderr_data.append(error)
+                        print(f"OOM on cmd:\n\n{cmd}\n\n", flush=True, file=sys.stderr)
+
+                events = sel.select(timeout=1)
+                if not events and p.poll() is not None:
+                    break  # No more events and the process has exited
+
+                for key, _ in events:
+                    data = key.fileobj.readline()
+                    if not data:  # EOF
+                        sel.unregister(key.fileobj)
+                        continue
+
+                    if guard_func:
+                        data = guard_func(data)
+
+                    if key.fileobj is p.stdout:
+                        stdout_data.append(data)
+                        if length + len(data) <= max_stream_length:
+                            if print_tags:
+                                if data.strip():
+                                    print_func(f"STDOUT: {data.strip()}")
+                            elif print_literal:
+                                print_func(data, end='')
+                            else:
+                                print_func(data)
+                        length += len(data)
+                    elif key.fileobj is p.stderr:
+                        stderr_data.append(data)
+                        if length + len(data) <= max_stream_length:
+                            if print_tags:
+                                if data.strip():
+                                    print_func(f"STDERR: {data.strip()}")
+                            elif print_literal:
+                                print_func(data, end='')
+                            else:
+                                print_func(data)
+                        length += len(data)
+
+                if p.poll() is not None and not sel.get_map():
+                    break  # Process has exited and no more data to read
+
+                # sleep shouldn't be too long or else will get chunky streaming and not detect memory usage rapidly enough
+                # sleep shouldn't be too short or else will constantly be doing psutil stuff
+                time.sleep(sleep)
+
+            p.wait(timeout=timeout)
+
+        # Prepare return object similar to subprocess.CompletedProcess
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=p.returncode,
+            stdout=''.join(stdout_data) if capture_output else None,
+            stderr=''.join(stderr_data) if capture_output else None
+        )
+
+    finally:
+        if script_path and os.path.exists(script_path):
+            os.remove(script_path)
 
 
 def str_to_list(x, allow_none=False):

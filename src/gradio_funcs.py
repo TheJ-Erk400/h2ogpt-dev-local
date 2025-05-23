@@ -397,7 +397,7 @@ def evaluate_nochat(*args1, default_kwargs1=None, str_api=False, plain_api=False
         db1s = my_db_state1
         clear_embeddings(user_kwargs['langchain_mode'], kwargs['db_type'], db1s, kwargs['dbs'])
         for image_file1 in image_files_to_delete:
-            if os.path.isfile(image_file1):
+            if image_file1 and os.path.isfile(image_file1):
                 remove(image_file1)
     save_dict['save_dir'] = kwargs['save_dir']
     save_generate_output(**save_dict)
@@ -557,8 +557,14 @@ def get_response(fun1, history, chatbot_role1, speaker1, tts_language1, roles_st
     import pyexiv2
     meta_data_images = []
     for image_files1 in image_files:
-        with pyexiv2.Image(image_files1) as img:
-            metadata = img.read_exif()
+        try:
+            with pyexiv2.Image(image_files1) as img:
+                metadata = img.read_exif()
+        except RuntimeError as e:
+            if 'unknown image type' in str(e):
+                metadata = {}
+            else:
+                raise
         if metadata is None:
             metadata = {}
         meta_data_images.append(metadata)
@@ -632,7 +638,10 @@ def get_response(fun1, history, chatbot_role1, speaker1, tts_language1, roles_st
             'image_batch_final_prompt')] or kwargs['image_batch_final_prompt'] or image_batch_final_prompt0
         # inject system prompt late, since if early then might not listen to it and generally high priority instructions
         system_prompt = fun1_args_list[len(input_args_list) + eval_func_param_names.index('system_prompt')]
-        system_prompt_xml = f"""\n<system_prompt>\n{system_prompt}\n</system_prompt>\n""" if system_prompt else ''
+        if system_prompt not in [None, 'None', 'auto']:
+            system_prompt_xml = f"""\n<system_prompt>\n{system_prompt}\n</system_prompt>\n""" if system_prompt else ''
+        else:
+            system_prompt_xml = ''
         if langchain_action1 == LangChainAction.QUERY.value:
             instruction_batch = image_batch_image_prompt + system_prompt_xml + instruction
             instruction_final = image_batch_final_prompt + system_prompt_xml + instruction

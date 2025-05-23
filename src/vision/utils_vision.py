@@ -12,26 +12,10 @@ from PIL.Image import Resampling
 
 from gradio_utils.grclient import check_job
 from src.enums import valid_imagegen_models, valid_imagechange_models, valid_imagestyle_models, docs_joiner_default, \
-    llava16_model_max_length, llava16_image_tokens, llava16_image_fudge
+    llava16_model_max_length, llava16_image_tokens, llava16_image_fudge, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS
 from src.image_utils import fix_image_file
 from src.utils import is_gradio_version4, get_docs_tokens, get_limited_text, makedirs, call_subprocess_onetask, \
     have_fiftyone, sanitize_filename
-
-IMAGE_EXTENSIONS = {'.png': 'PNG', '.apng': 'PNG', '.blp': 'BLP', '.bmp': 'BMP', '.dib': 'DIB', '.bufr': 'BUFR',
-                    '.cur': 'CUR', '.pcx': 'PCX', '.dcx': 'DCX', '.dds': 'DDS', '.ps': 'EPS', '.eps': 'EPS',
-                    '.fit': 'FITS', '.fits': 'FITS', '.fli': 'FLI', '.flc': 'FLI', '.fpx': 'FPX', '.ftc': 'FTEX',
-                    '.ftu': 'FTEX', '.gbr': 'GBR', '.gif': 'GIF', '.grib': 'GRIB', '.h5': 'HDF5', '.hdf': 'HDF5',
-                    '.jp2': 'JPEG2000', '.j2k': 'JPEG2000', '.jpc': 'JPEG2000', '.jpf': 'JPEG2000', '.jpx': 'JPEG2000',
-                    '.j2c': 'JPEG2000', '.icns': 'ICNS', '.ico': 'ICO', '.im': 'IM', '.iim': 'IPTC', '.jfif': 'JPEG',
-                    '.jpe': 'JPEG', '.jpg': 'JPEG', '.jpeg': 'JPEG', '.tif': 'TIFF', '.tiff': 'TIFF', '.mic': 'MIC',
-                    '.mpg': 'MPEG', '.mpeg': 'MPEG', '.mpo': 'MPO', '.msp': 'MSP', '.palm': 'PALM', '.pcd': 'PCD',
-                    '.pdf': 'PDF', '.pxr': 'PIXAR', '.pbm': 'PPM', '.pgm': 'PPM', '.ppm': 'PPM', '.pnm': 'PPM',
-                    '.psd': 'PSD', '.qoi': 'QOI', '.bw': 'SGI', '.rgb': 'SGI', '.rgba': 'SGI', '.sgi': 'SGI',
-                    '.ras': 'SUN', '.tga': 'TGA', '.icb': 'TGA', '.vda': 'TGA', '.vst': 'TGA', '.webp': 'WEBP',
-                    '.wmf': 'WMF', '.emf': 'WMF', '.xbm': 'XBM', '.xpm': 'XPM'}
-
-VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm'}
-
 
 def is_animated_gif(file_path):
     if not file_path.endswith('.gif'):
@@ -693,7 +677,7 @@ def get_image_model_dict(enable_image,
         if image_model_name in image_models:
             imagegen_index = image_models.index(image_model_name)
             if image_model_name == 'sdxl_turbo':
-                from src.vision.sdxl import get_pipe_make_image, make_image
+                from src.vision.sdxl_turbo import get_pipe_make_image, make_image
             elif image_model_name == 'playv2':
                 from src.vision.playv2 import get_pipe_make_image, make_image
             elif image_model_name == 'sdxl':
@@ -708,8 +692,11 @@ def get_image_model_dict(enable_image,
                                                refiner_model=None)
             elif image_model_name == 'flux.1-dev':
                 from src.vision.flux import get_pipe_make_image, make_image
+            elif image_model_name == 'flux.1-schnell':
+                from src.vision.flux import get_pipe_make_image_2 as get_pipe_make_image
+                from src.vision.flux import make_image
             elif image_model_name == 'sdxl_change':
-                from src.vision.sdxl import get_pipe_change_image as get_pipe_make_image, change_image
+                from src.vision.sdxl_turbo import get_pipe_change_image as get_pipe_make_image, change_image
                 make_image = change_image
             # FIXME: style
             else:

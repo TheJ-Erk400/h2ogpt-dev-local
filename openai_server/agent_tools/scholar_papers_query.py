@@ -21,7 +21,8 @@ def setup_argparse():
     parser.add_argument("-a", "--author", type=str, help="Filter by author name")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print full abstracts")
     parser.add_argument("-d", "--download", action="store_true", help="Attempt to download PDFs")
-    parser.add_argument("-o", "--output", type=str, default="papers", help="Output directory for downloaded PDFs")
+    parser.add_argument("-o", "--output_dir", type=str, default="papers", help="Output directory for downloaded PDFs")
+    parser.add_argument("--output", type=str, default="papers", help="Output file name for JSON file")
     parser.add_argument("-j", "--json", action="store_true", help="Output results as JSON")
     parser.add_argument("-r", "--references", type=int, default=0,
                         help="Number of references to include (Semantic Scholar only)")
@@ -98,6 +99,9 @@ def print_paper_info_arxiv(paper, index, args):
 def print_info(info, args):
     if args.json:
         print(json.dumps(info, indent=2))
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(info, f, indent=2)
     else:
         for key, value in info.items():
             if key == "open_access_pdf":
@@ -158,15 +162,22 @@ def main():
         print("-" * 50)
 
     if args.download:
-        os.makedirs(args.output, exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
 
     for i, paper in enumerate(papers, 1):
         print_func(paper, i, args)
         if args.download:
-            download_func(paper, args.output)
+            download_func(paper, args.output_dir)
         if i == args.limit:
             break
 
+    print("""\n\nRemember to not only use these scientific scholar paper listings,
+but also use ask_question_about_documents.py to ask questions about URLs or PDF documents,
+ask_question_about_image.py to ask questions about images,
+or download_web_video.py to download videos, etc.
+A general google or bing search might be advisable if no good results are present here or PDFs of interest are not available.
+If you have not found a good response to the user's original query, continue to write executable code to do so.
+""")
 
 if __name__ == "__main__":
     main()

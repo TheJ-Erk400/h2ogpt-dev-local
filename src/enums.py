@@ -140,7 +140,7 @@ class LangChainAction(Enum):
     IMAGE_STYLE = "ImageStyle"
 
 
-valid_imagegen_models = ['sdxl_turbo', 'sdxl', 'sd3', 'playv2', 'flux.1-dev']
+valid_imagegen_models = ['sdxl_turbo', 'sdxl', 'sd3', 'playv2', 'flux.1-dev', 'flux.1-schnell']
 valid_imagechange_models = ['sdxl_change']
 valid_imagestyle_models = ['sdxl_style']
 
@@ -193,6 +193,9 @@ gpt_token_mapping = {
     "gpt-4o-2024-05-13": 128000,  # 4096 output
     "gpt-4o-2024-08-06": 128000,  # 4096 output
     "gpt-4o-mini": 128000,  # 16384 output
+    # leave room for reasoning tokens
+    "o1-preview": 128000,  # 4096 output
+    "o1-mini": 128000,  # 4096 output
 }
 model_token_mapping = gpt_token_mapping.copy()
 model_token_mapping.update({
@@ -218,8 +221,11 @@ anthropic_mapping = {
     "claude-instant-1.2": 100000,
     "claude-3-opus-20240229": 200000,
     "claude-3-sonnet-20240229": 200000,
+    "claude-3-5-sonnet-20241022": 200000,
+    "claude-3-5-sonnet-latest": 200000,
     "claude-3-5-sonnet-20240620": 200000,
     "claude-3-haiku-20240307": 200000,
+    "claude-3-5-haiku-20241022": 200000,
 }
 
 anthropic_mapping_outputs = {
@@ -230,8 +236,19 @@ anthropic_mapping_outputs = {
     "claude-3-opus-20240229": 4096,
     "claude-3-sonnet-20240229": 4096,
     "claude-3-5-sonnet-20240620": 8192,
+    "claude-3-5-sonnet-20241022": 8192,
+    "claude-3-5-sonnet-latest": 8192,
     "claude-3-haiku-20240307": 4096,
+    "claude-3-5-haiku-20241022": 8192,
 }
+
+anthropic_prompt_caching = ["claude-3-opus-20240229",
+                            "claude-3-5-sonnet-20241022",
+                            "claude-3-5-sonnet-latest",
+                            "claude-3-5-sonnet-20240620",
+                            "claude-3-haiku-20240307",
+                            "claude-3-5-haiku-20241022",
+                            ]
 
 claude3imagetag = 'claude-3-image'
 gpt4imagetag = 'gpt-4-image'
@@ -288,7 +305,10 @@ images_num_max_dict = {'gpt-4-vision-preview': gpt4image_num_max,
                        'claude-3-opus-20240229': claude3image_num_max,
                        'claude-3-sonnet-20240229': claude3image_num_max,
                        'claude-3-5-sonnet-20240620': claude3image_num_max,
+                       'claude-3-5-sonnet-20241022': claude3image_num_max,
+                       'claude-3-5-sonnet-latest': claude3image_num_max,
                        'claude-3-haiku-20240307': claude3_haiku_image_num_max,
+                       'claude-3-5-haiku-20241022': claude3_haiku_image_num_max,
                        'liuhaotian/llava-v1.6-34b': 1,  # for lmdeploy
                        'liuhaotian/llava-v1.6-vicuna-13b': 1,  # for lmdeploy
                        'HuggingFaceM4/idefics2-8b-chatty': 10,
@@ -385,6 +405,9 @@ model_token_mapping_outputs.update({"gpt-4-1106-preview": 4096,
                                     "gpt-4o-2024-08-06": 4096,
                                     "gpt-4o-mini": 16384,
                                     "gpt-4o-mini-2024-07-18": 16384,
+                                    # deduces expected reasoning tokens
+                                    "o1-preview": 32768 - 25000,
+                                    "o1-mini": 65536 - 25000,
                                     }
                                    )
 
@@ -392,12 +415,16 @@ groq_mapping = {
     "mixtral-8x7b-32768": 32768,
     "gemma-7b-it": 8192,
     "llama2-70b-4096": 4096,
+    "llama-3.1-70b-versatile": 4096,
+    "llama-3.1-8b-instant": 4096,
 }
 
 groq_mapping_outputs = {
     "mixtral-8x7b-32768": 32768,
     "gemma-7b-it": 4096,
     "llama2-70b-4096": 4096,
+    "llama-3.1-70b-versatile": 131072,
+    "llama-3.1-8b-instant": 131072,
 }
 
 
@@ -794,8 +821,8 @@ json_object_post_prompt_reminder0 = 'Ensure your response is strictly valid JSON
 json_code_post_prompt_reminder0 = 'Ensure your response satisfies the schema mentioned above and place the response inside JSON code block.  Do not just repeat the JSON schema, ensure your response uses that schema to respond by choosing particular values for each type.'
 json_code2_post_prompt_reminder0 = 'Ensure your response is inside a JSON code block.'
 
-
-image_batch_image_prompt0 = """<response_instructions>
+image_batch_image_prompt0 = """
+<response_instructions>
 - Act as a keen observer with a sharp eye for detail.
 - Analyze the content within the images.
 - Provide insights based on your observations.
@@ -900,3 +927,26 @@ model_state_none0 = dict(model=None, tokenizer=None, device=None,
                          video_file=None,
                          display_name=None,
                          )
+
+
+IMAGE_EXTENSIONS = {'.png': 'PNG', '.apng': 'PNG', '.blp': 'BLP', '.bmp': 'BMP', '.dib': 'DIB', '.bufr': 'BUFR',
+                    '.cur': 'CUR', '.pcx': 'PCX', '.dcx': 'DCX', '.dds': 'DDS',
+                    # '.ps': 'EPS', '.eps': 'EPS',
+                    '.fit': 'FITS', '.fits': 'FITS', '.fli': 'FLI', '.flc': 'FLI', '.fpx': 'FPX', '.ftc': 'FTEX',
+                    '.ftu': 'FTEX', '.gbr': 'GBR', '.gif': 'GIF', '.grib': 'GRIB',
+                    # '.h5': 'HDF5', '.hdf': 'HDF5',
+                    '.jp2': 'JPEG2000', '.j2k': 'JPEG2000', '.jpc': 'JPEG2000', '.jpf': 'JPEG2000', '.jpx': 'JPEG2000',
+                    '.j2c': 'JPEG2000', '.icns': 'ICNS', '.ico': 'ICO', '.im': 'IM', '.iim': 'IPTC', '.jfif': 'JPEG',
+                    '.jpe': 'JPEG', '.jpg': 'JPEG', '.jpeg': 'JPEG', '.tif': 'TIFF', '.tiff': 'TIFF', '.mic': 'MIC',
+                    #'.mpg': 'MPEG', '.mpeg': 'MPEG',
+                    '.mpo': 'MPO', '.msp': 'MSP', '.palm': 'PALM', '.pcd': 'PCD',
+                    #'.pdf': 'PDF',
+                     '.pxr': 'PIXAR', '.pbm': 'PPM', '.pgm': 'PPM', '.ppm': 'PPM', '.pnm': 'PPM',
+                    '.psd': 'PSD', '.qoi': 'QOI', '.bw': 'SGI', '.rgb': 'SGI', '.rgba': 'SGI', '.sgi': 'SGI',
+                    '.ras': 'SUN', '.tga': 'TGA', '.icb': 'TGA', '.vda': 'TGA', '.vst': 'TGA', '.webp': 'WEBP',
+                    '.wmf': 'WMF', '.emf': 'WMF', '.xbm': 'XBM', '.xpm': 'XPM'}
+
+VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm'}
+
+
+max_stream_string_for_json = 1000

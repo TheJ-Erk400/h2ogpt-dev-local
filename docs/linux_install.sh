@@ -166,7 +166,7 @@ fi
 #* GPU Optional: For AutoGPTQ support on x86_64 linux
 #
 # in-transformers support of AutoGPTQ, requires also auto-gptq above to be installed since used internally by transformers/optimum
-pip install optimum==1.17.1 -c reqs_optional/reqs_constraints.txt
+#pip install optimum==1.22.0 -c reqs_optional/reqs_constraints.txt
 #    See [AutoGPTQ](README_GPU.md#autogptq) about running AutoGPT models.
 
 
@@ -216,7 +216,7 @@ fi
 if [[ -v CUDA_HOME ]];
 then
     pip install --upgrade pip
-    pip install flash-attn==2.4.2 --no-build-isolation --no-cache-dir -c reqs_optional/reqs_constraints.txt
+    pip install flash-attn==2.6.3 --no-build-isolation --no-cache-dir -c reqs_optional/reqs_constraints.txt
 fi
 
 
@@ -233,7 +233,9 @@ pip install https://h2o-release.s3.amazonaws.com/h2ogpt/duckdb-0.8.2.dev4025%2Bg
 #
 pip install -r reqs_optional/requirements_optional_agents.txt -c reqs_optional/reqs_constraints.txt
 #  For more info see [SERP Docs](README_SerpAPI.md).
-
+pip install aider-chat
+# now fix
+pip install transformers -U -c reqs_optional/reqs_constraints.txt
 
 # https://github.com/h2oai/h2ogpt/issues/1483
 pip uninstall flash_attn autoawq autoawq-kernels -y
@@ -247,6 +249,19 @@ pip install jinja2==3.1.4 -c reqs_optional/reqs_constraints.txt
 
 bash ./docs/run_patches.sh
 
+
+# NPM based
+npm install -g @mermaid-js/mermaid-cli
+npm install -g puppeteer-core
+# npx -y puppeteer browsers install chrome-headless-shell
+
+# fifty one doesn't install db right for wolfi, so improve
+# https://github.com/voxel51/fiftyone/issues/3975
+wget https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-7.0.4.tgz
+tar xvzf mongodb-linux-x86_64-ubuntu2204-7.0.4.tgz
+sudo mkdir -p /usr/lib/python3.10/site-packages/fiftyone/db/
+sudo cp -r mongodb-linux-x86_64-ubuntu2204-7.0.4/bin /usr/lib/python3.10/site-packages/fiftyone/db/
+sudo chmod -R a+rwx /usr/lib/python3.10/site-packages/fiftyone/db
 
 if [[ -z "${WOLFI_OS}" ]]; then
   #

@@ -34,7 +34,7 @@ from db_utils import set_userid, get_username_direct, get_userid_direct, fetch_u
 from model_utils import switch_a_roo_llama, get_on_disk_models, get_inf_models, model_lock_to_state
 from src.prompter_utils import get_chat_template, base64_decode_jinja_template
 from tts_utils import combine_audios
-from vision.utils_vision import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from src.enums import IMAGE_EXTENSIONS
 
 # This is a hack to prevent Gradio from phoning home when it gets imported
 os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
@@ -85,7 +85,7 @@ from gen import get_model, languages_covered, evaluate, score_qa, inputs_kwargs_
     get_model_max_length_from_tokenizer, \
     get_model_retry, remove_refs, model_name_to_prompt_type
 from evaluate_params import eval_func_param_names, no_default_param_names, eval_func_param_names_defaults, \
-    input_args_list
+    input_args_list, image_quality_choices, image_size_default
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -338,7 +338,7 @@ def go_gradio(**kwargs):
                                    " use Enter for multiple input lines)"
 
     if kwargs['visible_h2ogpt_links']:
-        description = """<a href="https://gpt-docs.h2o.ai">🎉✨ GO: OpenWebUI ✨🎉</a> <br /> <br /><a href="https://github.com/h2oai/h2ogpt">h2oGPT Code</a> <br /><a href="https://huggingface.co/h2oai">🤗 Models</a> <br /><a href="https://h2o.ai/platform/enterprise-h2ogpte/">h2oGPTe</a>"""
+        description = """<a href="https://github.com/pseudotensor/open-strawberry">🍓strawberry🍓 project: </a> <br /><a href="https://gpt-docs.h2o.ai">🎉✨ GO: OpenWebUI ✨🎉</a> <br /> <br /><a href="https://github.com/h2oai/h2ogpt">h2oGPT Code</a> <br /><a href="https://huggingface.co/h2oai">🤗 Models</a> <br /><a href="https://h2o.ai/platform/enterprise-h2ogpte/">h2oGPTe</a>"""
     else:
         description = None
     description_bottom = "If this host is busy, try<br>[Multi-Model](https://gpt.h2o.ai)<br>[CodeLlama](https://codellama.h2o.ai)<br>[Llama2 70B](https://llama.h2o.ai)<br>[Falcon 40B](https://falcon.h2o.ai)<br>[HF Spaces1](https://huggingface.co/spaces/h2oai/h2ogpt-chatbot)<br>[HF Spaces2](https://huggingface.co/spaces/h2oai/h2ogpt-chatbot2)<br>"
@@ -719,10 +719,12 @@ def go_gradio(**kwargs):
 
     if kwargs['model_lock']:
         have_vision_models = any(
-            [is_vision_model(x.get('base_model', '')) or x.get('base_model', 'NONE') in kwargs['is_vision_models'] for x
-             in kwargs['model_lock']])
+            [is_vision_model(x.get('base_model', '')) or
+             x.get('display_name', x.get('base_model')) in kwargs['is_vision_models'] for x in kwargs['model_lock']])
     else:
-        have_vision_models = is_vision_model(kwargs['base_model']) or kwargs['base_model'] in kwargs['is_vision_models']
+        have_vision_models = is_vision_model(kwargs['base_model']) or kwargs.get('display_name',
+                                                                                 kwargs['base_model']) in kwargs[
+                                 'is_vision_models']
 
     is_gradio_h2oai = get_is_gradio_h2oai()
 
@@ -742,6 +744,11 @@ def go_gradio(**kwargs):
                                        filterable=False,
                                        max_choices=None,
                                        )
+    image_quality_kwargs = dict(choices=image_quality_choices, label="Image Quality", value=image_quality_choices[0],
+                                visible=not is_public)
+    image_size_kwargs = dict(value=image_size_default, label="Image Size", visible=not is_public)
+    image_guidance_kwargs = dict(label="Image generation guidance", value=3.0, visible=not is_public)
+    image_num_inference_steps_kwargs = dict(label="Image generation inference steps", value=50, visible=not is_public)
 
     with demo:
         support_state_callbacks = hasattr(gr.State(), 'callback')
@@ -1394,6 +1401,10 @@ def go_gradio(**kwargs):
                 with image_tab:
                     if image_tab_visible:
                         visible_image_models = gr.Dropdown(**visible_image_models_kwargs)
+                        image_size = gr.Textbox(**image_size_kwargs)
+                        image_quality = gr.Dropdown(**image_quality_kwargs)
+                        image_guidance_scale = gr.Number(**image_guidance_kwargs)
+                        image_num_inference_steps = gr.Number(**image_num_inference_steps_kwargs)
                     with gr.Row(visible=image_control_panels_visible):
                         image_control = gr.Image(label="Input Image", type='filepath', elem_id="warning",
                                                  elem_classes="feedback")
@@ -1554,6 +1565,7 @@ def go_gradio(**kwargs):
                                                                          info="prompt to remind LLM to use json code when no schema",
                                                                          value=kwargs[
                                                                              'json_code2_post_prompt_reminder'])
+                            client_metadata = gr.Textbox(value='', visible=False)
 
                             def show_llava(x):
                                 return x
@@ -1768,6 +1780,7 @@ def go_gradio(**kwargs):
                             label="guided_whitespace_pattern, empty string means None",
                             info="https://github.com/vllm-project/vllm/pull/4305/files",
                             visible=not is_public)
+                        enable_caching = gr.Checkbox(value=kwargs['enable_caching'], visible=False)
                         images_num_max = gr.Number(
                             label='Number of Images per LLM call, -1 is auto mode, 0 is avoid using images',
                             value=kwargs['images_num_max'] if kwargs['images_num_max'] is not None else -1,
@@ -1910,6 +1923,14 @@ def go_gradio(**kwargs):
                                                         **noqueue_kwargs2,
                                                         )
 
+                    imagegen_control_visible = not image_tab_visible
+                    markdown_label = "Image Generation Control"
+                    gr.Markdown(markdown_label, visible=audio_visible)
+                    with gr.Row(visible=imagegen_control_visible):
+                        image_size = gr.Textbox(**image_size_kwargs)
+                        image_quality = gr.Dropdown(**image_quality_kwargs)
+                        image_guidance_scale = gr.Number(**image_guidance_kwargs)
+                        image_num_inference_steps = gr.Number(**image_num_inference_steps_kwargs)
                 models_tab = gr.TabItem("Models", visible=kwargs['visible_models_tab']) if kwargs[
                     'visible_models_tab'] else gr.Row(visible=False)
                 with models_tab:
@@ -5798,6 +5819,8 @@ def go_gradio(**kwargs):
                 inference_server_split = inference_server.split(':')
                 inference_server_type = inference_server_split[0].strip() if len(
                     inference_server_split) > 0 else inference_server
+                if 'api.together.xyz' in inference_server:
+                    inference_server_type = 'together.ai'
                 from gradio_utils.grclient import GradioClient
                 if isinstance(model_state3.get('model', ''), GradioClient):
                     inference_server_type = 'gradio'
@@ -6130,11 +6153,11 @@ def go_gradio(**kwargs):
         stop_event = stop_btn.click(lambda: None, None, None,
                                     cancels=submits1 + submits2 + submits3 + submits4 +
                                             [submit_event_nochat, submit_event_nochat2] +
-                                            [eventdb1, eventdb2, eventdb3] +
-                                            [eventdb7a, eventdb7, eventdb8a, eventdb8, eventdb9a, eventdb9, eventdb12a,
-                                             eventdb12] +
-                                            db_events +
-                                            [eventdbloadla, eventdbloadlb] +
+                                            # [eventdb1, eventdb2, eventdb3] +
+                                            # [eventdb7a, eventdb7, eventdb8a, eventdb8, eventdb9a, eventdb9, eventdb12a,
+                                            # eventdb12] +
+                                            # db_events +
+                                            # [eventdbloadla, eventdbloadlb] +
                                             [clear_event] +
                                             [submit_event_nochat_api, submit_event_nochat] +
                                             [load_model_event, load_model_event2] +
@@ -6442,6 +6465,7 @@ def go_gradio(**kwargs):
             if verbose:
                 print("Starting up Function server")
             if kwargs['function_server_workers'] == 1:
+                os.environ['H2OGPT_MAIN_KWARGS'] = run_kwargs['main_kwargs']
                 from openai_server.function_server import app as function_app
             else:
                 function_app = 'function_server:app'

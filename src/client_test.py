@@ -71,7 +71,9 @@ def get_client(serialize=not is_gradio_version4):
     return client
 
 
-def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
+def get_args(prompt, prompt_type=None, chat=False,
+             stream_output=False,
+             enable_caching=False,
              max_new_tokens=50,
              top_k_docs=3,
              langchain_mode='Disabled',
@@ -84,6 +86,10 @@ def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
              h2ogpt_key=None,
              visible_models=None,
              visible_image_models=None,
+             image_size=None,
+             image_quality=None,
+             image_guidance_scale=None,
+             image_num_inference_steps=None,
              system_prompt='',  # default of no system prompt triggered by empty string
              add_search_to_context=False,
              chat_conversation=None,
@@ -106,6 +112,7 @@ def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
                          # streaming output is supported, loops over and outputs each generation in streaming mode
                          # but leave stream_output=False for simple input/output mode
                          stream_output=stream_output,
+                         enable_caching=enable_caching,
                          prompt_type=prompt_type,
                          prompt_dict=prompt_dict,
                          chat_template=chat_template,
@@ -166,6 +173,10 @@ def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
                          llava_prompt=None,
                          visible_models=visible_models,
                          visible_image_models=visible_image_models,
+                         image_size=image_size,
+                         image_quality=image_quality,
+                         image_guidance_scale=image_guidance_scale,
+                         image_num_inference_steps=image_num_inference_steps,
                          h2ogpt_key=h2ogpt_key,
                          add_search_to_context=add_search_to_context,
                          chat_conversation=chat_conversation,
@@ -208,6 +219,7 @@ def get_args(prompt, prompt_type=None, chat=False, stream_output=False,
                          guided_whitespace_pattern=None,
 
                          model_lock=None,
+                         client_metadata=None,
                          )
     diff = 0
     from evaluate_params import eval_func_param_names

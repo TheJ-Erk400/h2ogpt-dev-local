@@ -35,6 +35,7 @@ import filelock
 import tabulate
 
 from joblib import delayed
+from langchain_anthropic.chat_models import _format_messages, _tools_in_params, _make_message_chunk_from_anthropic_event
 from langchain_core.callbacks import streaming_stdout, AsyncCallbackManager, BaseCallbackHandler, BaseCallbackManager
 from langchain.callbacks.base import Callbacks
 from langchain_community.document_transformers import Html2TextTransformer, BeautifulSoupTransformer
@@ -45,10 +46,11 @@ from langchain.prompts.chat import ChatPromptValue
 from langchain.schema import LLMResult, Generation, PromptValue
 from langchain.schema.output import GenerationChunk
 from langchain_core.globals import get_llm_cache
+from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.llms import aget_prompts, aupdate_cache
 from langchain_core.load import dumpd
 from langchain_core.messages import BaseMessage
-from langchain_core.outputs import ChatResult, RunInfo
+from langchain_core.outputs import ChatResult, RunInfo, ChatGenerationChunk
 from langchain_experimental.tools import PythonREPLTool
 from langchain_community.tools.json.tool import JsonSpec
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -66,7 +68,7 @@ from image_utils import fix_image_file, get_image_types, get_image_file
 from output_parser import H2OPythonMRKLOutputParser
 from pandas_agent_langchain import create_csv_agent, create_pandas_dataframe_agent
 from src.h2oai_pipeline import H2OTextGenerationPipeline
-from src.langchain_openai import H2OBaseChatOpenAI, H2OBaseAzureChatOpenAI
+from src.langchain_openai_local import H2OBaseChatOpenAI, H2OBaseAzureChatOpenAI
 from stopping import update_terminate_responses
 from utils import wrapped_partial, EThread, import_matplotlib, sanitize_filename, makedirs, get_url, flatten_list, \
     get_device, ProgressParallel, remove, hash_file, clear_torch_cache, NullContext, get_hf_server, FakeTokenizer, \
@@ -87,7 +89,7 @@ from enums import DocumentSubset, no_lora_str, model_token_mapping, source_prefi
     noop_prompt_type, unknown_prompt_type, template_prompt_type, none, claude3_image_tokens, gemini_image_tokens, \
     gpt4_image_tokens, user_prompt_for_fake_system_prompt0, empty_prompt_type, \
     is_gradio_vision_model, is_json_model, anthropic_mapping, gemini15image_num_max, gemini15imagetag, \
-    openai_supports_functiontools, openai_supports_parallel_functiontools
+    openai_supports_functiontools, openai_supports_parallel_functiontools, anthropic_prompt_caching
 from evaluate_params import gen_hyper, gen_hyper0
 from gen import SEED, get_limited_prompt, get_relaxed_max_new_tokens, get_model_retry, gradio_to_llm, \
     get_client_from_inference_server
@@ -930,6 +932,7 @@ class GradioInference(AGenerateStreamFirst, H2Oagenerate, LLM):
 
     return_full_text: bool = False
     stream_output: bool = False
+    enable_caching: bool = False
     sanitize_bot_response: bool = False
 
     prompter: Any = None
@@ -977,6 +980,7 @@ class GradioInference(AGenerateStreamFirst, H2Oagenerate, LLM):
     guided_choice: Any = None
     guided_grammar: Any = None
     guided_whitespace_pattern: Any = None
+    client_metadata: Any = ''
 
     async_sem: Any = None
     count_input_tokens: Any = 0
@@ -1017,6 +1021,7 @@ class GradioInference(AGenerateStreamFirst, H2Oagenerate, LLM):
         # This is good, so gradio server can also handle stopping.py conditions
         # this is different than TGI server that uses prompter to inject prompt_type prompting
         stream_output = self.stream_output
+        enable_caching = self.enable_caching
         # don't double-up langchain behavior, already did langchain part
         client_langchain_mode = LangChainMode.LLM.value
         client_add_chat_history_to_context = self.add_chat_history_to_context
@@ -1047,6 +1052,7 @@ class GradioInference(AGenerateStreamFirst, H2Oagenerate, LLM):
                              # streaming output is supported, loops over and outputs each generation in streaming mode
                              # but leave stream_output=False for simple input/output mode
                              stream_output=stream_output,
+                             enable_caching=enable_caching,
                              prompt_type=prompt_type,
                              prompt_dict='',
                              chat_template=self.chat_template,
@@ -1141,6 +1147,7 @@ class GradioInference(AGenerateStreamFirst, H2Oagenerate, LLM):
                              guided_choice=self.guided_choice,
                              guided_grammar=self.guided_grammar,
                              guided_whitespace_pattern=self.guided_whitespace_pattern,
+                             client_metadata=self.client_metadata,
                              )
         api_name = '/submit_nochat_api'  # NOTE: like submit_nochat but stable API for string dict passing
         # let inner gradio count input tokens
@@ -2255,6 +2262,7 @@ class H2OTextGenOpenAI:
 
 
 class H2OOpenAI(H2OTextGenOpenAI, OpenAI):
+    temperature: float = 0.0
     """
     New class to handle vLLM's use of OpenAI, no vllm_chat supported, so only need here
     Handles prompting that OpenAI doesn't need, stopping as well
@@ -2444,8 +2452,28 @@ class ExtraChat:
             print('count_input_tokens for %s: %s' % (str(self.__class__.__name__), self.count_input_tokens), flush=True)
         return prompt_messages
 
+    def get_num_tokens(self, text: str) -> int:
+        tokens = self.get_token_ids(text)
+        if isinstance(tokens, list):
+            return len(tokens)
+        elif isinstance(tokens, dict) and 'input_ids' in tokens:
+            return len(tokens['input_ids'])
+        else:
+            return len(tokens)
+
 
 class GenerateStream:
+    def get_count_output_tokens(self, ret):
+        if hasattr(ret, 'llm_output') and 'model_name' in ret.llm_output and ret.llm_output['model_name'] in ['o1-mini',
+                                                                                                              'o1-preview']:
+            usage_dict = ret.llm_output['token_usage']
+            if 'completion_tokens' in usage_dict:
+                self.count_output_tokens += usage_dict['completion_tokens']
+            if 'completion_tokens_details' in usage_dict and 'reasoning_tokens' in usage_dict[
+                'completion_tokens_details']:
+                print("reasoning tokens for %s: %s" % (
+                ret.llm_output['model_name'], usage_dict['completion_tokens_details']['reasoning_tokens']))
+
     def generate_prompt(
             self,
             prompts: List[PromptValue],
@@ -2459,12 +2487,16 @@ class GenerateStream:
             kwargs['streaming'] = self.streaming
         # prompt_messages = [p.to_messages() for p in prompts]
         try:
-            return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+            ret = self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+            self.get_count_output_tokens(ret)
+            return ret
         except Exception as e:
             if 'Internal server error' in str(e):
                 print("Internal server error, retrying", flush=True)
                 time.sleep(5)
                 return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+            else:
+                raise
 
     async def agenerate_prompt(
             self,
@@ -2478,9 +2510,11 @@ class GenerateStream:
         # prompt_messages = [p.to_messages() for p in prompts]
         if 'streaming' not in kwargs:
             kwargs['streaming'] = self.streaming
-        return await self.agenerate(
+        ret = await self.agenerate(
             prompt_messages, stop=stop, callbacks=callbacks, **kwargs
         )
+        self.get_count_output_tokens(ret)
+        return ret
 
     def _generate(
             self,
@@ -2497,9 +2531,11 @@ class GenerateStream:
             have_tool = True
         kwargs.pop('stream', None)
         kwargs.pop('streaming', None)
+        # gemini specific:
         if hasattr(self, 'safety_settings'):
             # google
             kwargs['safety_settings'] = self.safety_settings
+        # gemini specific:
         if hasattr(self, 'response_format') and self.response_format == 'json_object':
             kwargs['generation_config'] = dict(response_mime_type='application/json')
             if self.guided_json and isinstance(self.guided_json, dict) and self.model == 'models/gemini-1.5-pro-latest':
@@ -2574,6 +2610,17 @@ class GenerateStream:
 
 
 class GenerateNormal:
+    def get_count_output_tokens(self, ret):
+        if hasattr(ret, 'llm_output') and 'model_name' in ret.llm_output and ret.llm_output['model_name'] in ['o1-mini',
+                                                                                                              'o1-preview']:
+            usage_dict = ret.llm_output['token_usage']
+            if 'completion_tokens' in usage_dict:
+                self.count_output_tokens += usage_dict['completion_tokens']
+            if 'completion_tokens_details' in usage_dict and 'reasoning_tokens' in usage_dict[
+                'completion_tokens_details']:
+                print("reasoning tokens for %s: %s" % (
+                ret.llm_output['model_name'], usage_dict['completion_tokens_details']['reasoning_tokens']))
+
     def generate_prompt(
             self,
             prompts: List[PromptValue],
@@ -2584,7 +2631,9 @@ class GenerateNormal:
         self.prompts.extend(prompts)
         prompt_messages = self.get_messages(prompts)
         # prompt_messages = [p.to_messages() for p in prompts]
-        return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+        ret = self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+        self.get_count_output_tokens(ret)
+        return ret
 
     async def agenerate_prompt(
             self,
@@ -2596,9 +2645,11 @@ class GenerateNormal:
         self.prompts.extend(prompts)
         prompt_messages = self.get_messages(prompts)
         # prompt_messages = [p.to_messages() for p in prompts]
-        return await self.agenerate(
+        ret = await self.agenerate(
             prompt_messages, stop=stop, callbacks=callbacks, **kwargs
         )
+        self.get_count_output_tokens(ret)
+        return ret
 
 
 class GenerateStream2:
@@ -2685,7 +2736,8 @@ class GenerateStream2:
 
 
 class H2OChatOpenAI(ChatAGenerateStreamFirst, GenerateStream, ExtraChat, H2OBaseChatOpenAI, ChatOpenAI):
-    tokenizer: Any = None  # for vllm_chat
+    temperature: float = 0.0
+    tokenizer: Any = None
     system_prompt: Any = None
     chat_conversation: Any = []
     user_prompt_for_fake_system_prompt: Any = None
@@ -2705,6 +2757,7 @@ class H2OChatOpenAI(ChatAGenerateStreamFirst, GenerateStream, ExtraChat, H2OBase
 
 
 class H2OAzureChatOpenAI(ChatAGenerateStreamFirst, GenerateNormal, ExtraChat, H2OBaseAzureChatOpenAI):
+    temperature: float = 0.0
     system_prompt: Any = None
     chat_conversation: Any = []
     user_prompt_for_fake_system_prompt: Any = None
@@ -2712,6 +2765,7 @@ class H2OAzureChatOpenAI(ChatAGenerateStreamFirst, GenerateNormal, ExtraChat, H2
     count_input_tokens: Any = 0
     count_output_tokens: Any = 0
     prompter: Any = None
+    tokenizer: Any = None
 
     def get_token_ids(self, text: str) -> List[int]:
         """Get the tokens present in the text with tiktoken package."""
@@ -2734,6 +2788,8 @@ class H2OChatAnthropic2(ChatAGenerateStreamFirst, GenerateNormal, ExtraChat, Cha
     count_output_tokens: Any = 0
     tokenizer: Any = None
     prompter: Any = None
+    supports_caching: bool = False
+    enable_caching: bool = False
 
     # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
 
@@ -2752,8 +2808,119 @@ class H2OChatAnthropic3(ChatAGenerateStreamFirst, GenerateStream, ExtraChat, Cha
     count_output_tokens: Any = 0
     tokenizer: Any = None
     prompter: Any = None
+    supports_caching: bool = False
+    enable_caching: bool = False
 
     # max_new_tokens0: Any = None  # FIXME: Doesn't seem to have same max_tokens == -1 for prompts==1
+
+    @staticmethod
+    def process_messages(messages, max_cache_controls=3):
+        processed_messages = []
+        cache_control_count = 0
+
+        for message in reversed(messages):
+            if message["role"] == "user":
+                if isinstance(message["content"], str):
+                    content = [{
+                        "type": "text",
+                        "text": message["content"]
+                    }]
+                    if cache_control_count < max_cache_controls:
+                        content[0]["cache_control"] = {"type": "ephemeral"}
+                        cache_control_count += 1
+                elif isinstance(message["content"], list):
+                    content = []
+                    for item in reversed(message["content"]):
+                        if isinstance(item, dict):
+                            item_copy = item.copy()
+                            if cache_control_count < max_cache_controls:
+                                item_copy["cache_control"] = {"type": "ephemeral"}
+                                cache_control_count += 1
+                            content.append(item_copy)
+                        else:
+                            content.append(item)
+                    content.reverse()  # Restore original order within the message
+                else:
+                    content = message["content"]
+
+                processed_messages.append({
+                    "role": "user",
+                    "content": content
+                })
+            else:
+                processed_messages.append(message)
+
+        return list(reversed(processed_messages))  # Reverse to restore original order
+
+    def _get_request_payload(
+            self,
+            input_: LanguageModelInput,
+            *,
+            stop: Optional[List[str]] = None,
+            **kwargs: Dict,
+    ) -> Dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if hasattr(self, 'supports_caching') and self.supports_caching and \
+                hasattr(self, 'enable_caching') and self.enable_caching:
+            messages = payload['messages']
+            system = payload.get('system', '')
+
+            # fix system
+            system_cached = [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }] if system else ''
+
+            # Process user and assistant messages
+            messages_cached = self.process_messages(messages)
+
+            # put messages and system back in
+            payload['messages'] = messages_cached
+            payload['system'] = system_cached
+        # print('payload: %s' % payload, flush=True)
+        return payload
+
+    def _stream(
+            self,
+            messages: List[BaseMessage],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            *,
+            stream_usage: Optional[bool] = None,
+            **kwargs: Any,
+    ) -> typing.Iterator[ChatGenerationChunk]:
+        if stream_usage is None:
+            stream_usage = self.stream_usage
+        kwargs["stream"] = True
+        payload = self._get_request_payload(messages, stop=stop, **kwargs)
+        stream = self._client.messages.create(**payload)
+        coerce_content_to_string = not _tools_in_params(payload)
+        for event in stream:
+            if event.type == "message_start":
+                usage = event.message.usage
+                input_tokens = dict(usage).get('input_tokens', 0)
+                cache_creation_input_tokens = dict(usage).get('cache_creation_input_tokens', 0)
+                cache_read_input_tokens = dict(usage).get('cache_read_input_tokens', 0)
+                # estimated cost effect, cache hits are roughly free compared to input or creation
+                self.count_input_tokens += (cache_creation_input_tokens - cache_read_input_tokens)
+                print(f"input_tokens: {input_tokens}")
+                print(f"cache_creation_input_tokens: {cache_creation_input_tokens}")
+                print(f"cache_read_input_tokens: {cache_read_input_tokens}")
+            elif event.type == "message_delta":
+                output_tokens = dict(event.usage).get('output_tokens', 0)
+                self.count_output_tokens += output_tokens
+
+            msg = _make_message_chunk_from_anthropic_event(
+                event,
+                stream_usage=stream_usage,
+                coerce_content_to_string=coerce_content_to_string,
+            )
+            if msg is not None:
+                chunk = ChatGenerationChunk(message=msg)
+                if run_manager and isinstance(msg.content, str):
+                    run_manager.on_llm_new_token(msg.content, chunk=chunk)
+                yield chunk
 
 
 class H2OChatAnthropic3Sys(H2OChatAnthropic3):
@@ -2774,6 +2941,7 @@ class H2OChatGoogle(ChatAGenerateStreamFirst, GenerateStream, ExtraChat, ChatGoo
     user_prompt_for_fake_system_prompt: Any = None
     prompts: Any = []
     streaming: Any = False
+    tokenizer: Any = None
     count_input_tokens: Any = 0
     count_output_tokens: Any = 0
     prompter: Any = None
@@ -2896,6 +3064,7 @@ def get_llm(use_openai_model=False,
             langchain_only_model=None,
             load_awq='',
             stream_output=False,
+            enable_caching=False,
             async_output=True,
             num_async=3,
             do_sample=False,
@@ -3128,7 +3297,8 @@ def get_llm(use_openai_model=False,
         kwargs_extra = {}
 
         if json_vllm:
-            response_format_real = response_format if guided_json and response_format == 'json_object' else 'text'
+            response_format_real = response_format if not (
+                    guided_json or guided_regex or guided_choice or guided_grammar) else 'text'
             vllm_extra_dict = get_vllm_extra_dict(tokenizer,
                                                   stop_sequences=prompter.stop_sequences if prompter else [],
                                                   # repetition_penalty=repetition_penalty,  # could pass
@@ -3160,7 +3330,10 @@ def get_llm(use_openai_model=False,
             tools_openai = []
         openai_model_supports_tools = model_name in openai_supports_functiontools + openai_supports_parallel_functiontools
         openai_model_supports_json = is_json_model(model_name, inference_server)
-        openai_supports_json_or_tools = response_format == 'json_object' and openai_model_supports_json or openai_model_supports_tools and guided_json
+        if not json_vllm:
+            openai_supports_json_or_tools = response_format == 'json_object' and openai_model_supports_json or openai_model_supports_tools and guided_json
+        else:
+            openai_supports_json_or_tools = False
         if inf_type == 'openai_chat' or inf_type == 'vllm_chat':
             kwargs_extra.update(dict(system_prompt=system_prompt,
                                      chat_conversation=chat_conversation,
@@ -3171,11 +3344,14 @@ def get_llm(use_openai_model=False,
                 if is_json_model(model_name, inference_server,
                                  json_vllm=json_vllm) and response_format == 'json_object':
                     # vllm without guided_json can't make json directly
-                    kwargs_extra.update(dict(response_format=dict(type=response_format if guided_json else 'text')))
-                async_output = False  # https://github.com/h2oai/h2ogpt/issues/928
+                    if not json_vllm:
+                        kwargs_extra.update(dict(response_format=dict(type=response_format if guided_json else 'text')))
+                    else:
+                        # for vllm 0.6.3+
+                        kwargs_extra.update(dict(response_format=dict(type='text')))
+                # async_output = False  # https://github.com/h2oai/h2ogpt/issues/928
                 # async_sem = asyncio.Semaphore(num_async) if async_output else NullContext()
-                kwargs_extra.update(dict(tokenizer=tokenizer,
-                                         openai_api_key=api_key,
+                kwargs_extra.update(dict(openai_api_key=api_key,
                                          # batch_size=1,
                                          client=openai_client_completions,
                                          async_client=openai_async_client_completions,
@@ -3191,7 +3367,10 @@ def get_llm(use_openai_model=False,
                         kwargs_extra.update(dict(response_format=dict(type='text'), parallel_tool_calls=False))
                     else:
                         # Not vllm, guided_json not required
-                        kwargs_extra.update(dict(response_format=dict(type=response_format)))
+                        if not json_vllm:
+                            kwargs_extra.update(dict(response_format=dict(type=response_format)))
+                        else:
+                            kwargs_extra.update(dict(response_format=dict(type='text')))
         elif inf_type == 'openai_azure_chat':
             cls = H2OAzureChatOpenAI
             if 'response_format' not in azure_kwargs and openai_supports_json_or_tools:
@@ -3226,12 +3405,11 @@ def get_llm(use_openai_model=False,
                                          sanitize_bot_response=sanitize_bot_response,
                                          context=context,
                                          iinput=iinput,
-                                         tokenizer=tokenizer,
                                          chat_conversation=chat_conversation,
                                          user_prompt_for_fake_system_prompt=user_prompt_for_fake_system_prompt,
                                          openai_api_base=base_url,
                                          openai_api_key=api_key,
-                                         batch_size=1,  # https://github.com/h2oai/h2ogpt/issues/928
+                                         batch_size=num_async if async_output else 1,
                                          client=openai_client_completions,
                                          async_client=openai_async_client_completions,
                                          async_sem=async_sem,
@@ -3257,10 +3435,23 @@ def get_llm(use_openai_model=False,
         if inf_type == 'vllm_chat':
             model_name = get_model_name(model_name, openai_client)
 
+        gen_server_kwargs = dict(temperature=temperature if do_sample else 0.0,
+                                 # FIXME: Need to count tokens and reduce max_new_tokens to fit like in generate.py
+                                 max_tokens=max_new_tokens,
+                                 )
+
+        if model_name in ['o1-mini', 'o1-preview']:
+            gen_server_kwargs['max_completion_tokens'] = gen_server_kwargs.pop('max_tokens')
+            max_reasoning_tokens = int(os.getenv("MAX_REASONING_TOKENS", 25000))
+            gen_server_kwargs['max_completion_tokens'] = max_reasoning_tokens + max(100, gen_server_kwargs[
+                'max_completion_tokens'])
+            gen_server_kwargs['temperature'] = 1.0
+            model_kwargs.pop('presence_penalty', None)
+            model_kwargs.pop('n', None)
+            model_kwargs.pop('frequency_penalty', None)
+            model_kwargs.pop('top_p', None)
+
         llm = cls(model_name=model_name,
-                  temperature=temperature if do_sample else 0.0,
-                  # FIXME: Need to count tokens and reduce max_new_tokens to fit like in generate.py
-                  max_tokens=max_new_tokens,
                   model_kwargs=model_kwargs,
                   callbacks=callbacks if stream_output else None,
                   max_retries=6,
@@ -3268,7 +3459,9 @@ def get_llm(use_openai_model=False,
                   verbose=verbose,
                   request_timeout=max_time,
                   prompter=prompter,
-                  **kwargs_extra
+                  tokenizer=tokenizer,
+                  **gen_server_kwargs,
+                  **kwargs_extra,
                   )
         streamer = callbacks[0] if stream_output else None
         if inf_type in ['openai', 'openai_chat', 'openai_azure', 'openai_azure_chat']:
@@ -3317,6 +3510,10 @@ def get_llm(use_openai_model=False,
             # FIXME: _AnthropicCommon ignores these and makes no client anyways
             kwargs_extra.update(dict(client=model['client'], async_client=model['async_client']))
 
+        supports_caching = model_name in anthropic_prompt_caching
+        if supports_caching:
+            kwargs_extra.update(extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"})
+
         callbacks = [streaming_callback]
         llm = cls(model=model_name,
                   anthropic_api_key=os.getenv('ANTHROPIC_API_KEY'),
@@ -3332,6 +3529,8 @@ def get_llm(use_openai_model=False,
                   tokenizer=tokenizer,
                   prompter=prompter,
                   verbose=verbose,
+                  supports_caching=supports_caching,
+                  enable_caching=enable_caching,
                   **kwargs_extra
                   )
         streamer = callbacks[0] if stream_output else None
@@ -3705,6 +3904,7 @@ def get_llm(use_openai_model=False,
 
                 callbacks=callbacks if stream_output else None,
                 stream_output=stream_output,
+                enable_caching=enable_caching,
 
                 prompter=prompter,
                 context=context,
@@ -4615,14 +4815,18 @@ def file_to_doc(file,
                 docs1.extend(docs1a)
             if len(docs1) == 0 and have_playwright or do_playwright:
                 # then something went wrong, try another loader:
-                from langchain_community.document_loaders import PlaywrightURLLoader
-                docs1a = asyncio.run(PlaywrightURLLoader(urls=final_urls).aload())
-                # docs1 = PlaywrightURLLoader(urls=[file]).load()
-                docs1a = [x for x in docs1a if
-                          x.page_content and x.page_content != '403 Forbidden' and not x.page_content.startswith(
-                              'Access Denied')]
-                add_parser(docs1a, 'PlaywrightURLLoader')
-                docs1.extend(docs1a)
+                try:
+                    from langchain_community.document_loaders import PlaywrightURLLoader
+                    docs1a = asyncio.run(PlaywrightURLLoader(urls=final_urls).aload())
+                    # docs1 = PlaywrightURLLoader(urls=[file]).load()
+                    docs1a = [x for x in docs1a if
+                              x.page_content and x.page_content != '403 Forbidden' and not x.page_content.startswith(
+                                  'Access Denied')]
+                    add_parser(docs1a, 'PlaywrightURLLoader')
+                    docs1.extend(docs1a)
+                except Exception as e0:
+                    traceback.print_exc()
+                    print("playwright failed: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
             if len(docs1) == 0 and have_selenium or do_selenium:
                 # then something went wrong, try another loader:
                 # but requires Chrome binary, else get: selenium.common.exceptions.WebDriverException:
@@ -4700,7 +4904,7 @@ def file_to_doc(file,
                 makedirs(tmpdir, exist_ok=True)
                 text = docx2txt.process(file, tmpdir)
                 images = os.listdir(tmpdir)
-                docs1 = path_to_docs_func([os.path.join(tmpdir, x) for x in images])
+                docs1.extend(path_to_docs_func([os.path.join(tmpdir, x) for x in images]))
             except Exception as e:
                 print("docx images failure: %s" % str(e))
 
@@ -4918,33 +5122,90 @@ def file_to_doc(file,
                 print("END: Pix2Struct", flush=True)
         if llava_model and enable_llava and 'vllm' not in llava_model:
             file_llava = fix_image_file(file, do_align=True, do_rotate=True, do_pad=False)
-            # LLaVa
-            if verbose:
-                print("BEGIN: LLaVa", flush=True)
-            try:
-                from vision.utils_vision import get_llava_response
-                res, llava_prompt = get_llava_response(file_llava, llava_model,
-                                                       prompt=llava_prompt,
-                                                       allow_prompt_auto=True,
-                                                       max_time=60,  # not too much time for docQA
-                                                       verbose=verbose,
-                                                       )
-                metadata = dict(source=file, date=str(datetime.now()), input_type='LLaVa')
-                docs1c = [Document(page_content=res, metadata=metadata)]
-                docs1c = [x for x in docs1c if x.page_content]
-                add_meta(docs1c, file, parser='LLaVa: %s' % llava_model, file_as_source=True)
-                # caption didn't set source, so fix-up meta
-                hash_of_file = hash_file(file)
-                [doci.metadata.update(source=file, source_true=file_llava, hashid=hash_of_file,
-                                      llava_prompt=llava_prompt or '') for doci in
-                 docs1c]
-                docs1.extend(docs1c)
-            except BaseException as e0:
-                print("LLaVa: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
-                e = e0
-            handled |= len(docs1) > 0
-            if verbose:
-                print("END: LLaVa", flush=True)
+
+            if llava_model.startswith('openai:'):
+                if verbose:
+                    print("BEGIN: OpenAI docAI", flush=True)
+                try:
+                    from openai import OpenAI
+                    openai_client = OpenAI(base_url=os.getenv('H2OGPT_OPENAI_BASE_URL', 'https://api.openai.com'),
+                                           api_key=os.getenv('H2OGPT_OPENAI_API_KEY', 'EMPTY'), timeout=60)
+                    if llava_prompt in ['auto', None]:
+                        llava_prompt = "Describe the image and what does the image say?"
+                    from vision.utils_vision import img_to_base64
+                    file_llava_url = img_to_base64(file_llava)
+                    content = [{
+                        'type': 'text',
+                        'text': llava_prompt,
+                    }, {
+                        'type': 'image_url',
+                        'image_url': {
+                            'url':
+                                file_llava_url,
+                        },
+                    }]
+                    messages = [dict(role='system',
+                                     content='You are a keen document vision model that can understand complex images and text and respond to queries or convert text inside images to text.'),
+                                dict(role='user', content=content)]
+                    stream_output = False
+                    gen_server_kwargs = dict()
+                    model_name = llava_model.split('openai:')[1]
+                    responses = openai_client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        stream=stream_output,
+                        **gen_server_kwargs,
+                    )
+                    if responses.choices is None and responses.model_extra:
+                        raise RuntimeError("OpenAI Chat failed: %s" % responses.model_extra)
+                    res = responses.choices[0].message.content
+                    if not res:
+                        raise RuntimeError("OpenAI Chat had no response")
+
+                    metadata = dict(source=file, date=str(datetime.now()), input_type='OpenAI DocAI')
+                    docs1c = [Document(page_content=res, metadata=metadata)]
+                    docs1c = [x for x in docs1c if x.page_content]
+                    add_meta(docs1c, file, parser='LLaVa: %s' % llava_model, file_as_source=True)
+                    # caption didn't set source, so fix-up meta
+                    hash_of_file = hash_file(file)
+                    [doci.metadata.update(source=file, source_true=file_llava, hashid=hash_of_file,
+                                          llava_prompt=llava_prompt or '') for doci in
+                     docs1c]
+                    docs1.extend(docs1c)
+                except BaseException as e0:
+                    print("LLaVa: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
+                    e = e0
+                handled |= len(docs1) > 0
+                if verbose:
+                    print("END: OpenAI docAI", flush=True)
+            else:
+                # LLaVa
+                if verbose:
+                    print("BEGIN: LLaVa", flush=True)
+                try:
+                    from vision.utils_vision import get_llava_response
+                    res, llava_prompt = get_llava_response(file_llava, llava_model,
+                                                           prompt=llava_prompt,
+                                                           allow_prompt_auto=True,
+                                                           max_time=60,  # not too much time for docQA
+                                                           verbose=verbose,
+                                                           )
+                    metadata = dict(source=file, date=str(datetime.now()), input_type='LLaVa')
+                    docs1c = [Document(page_content=res, metadata=metadata)]
+                    docs1c = [x for x in docs1c if x.page_content]
+                    add_meta(docs1c, file, parser='LLaVa: %s' % llava_model, file_as_source=True)
+                    # caption didn't set source, so fix-up meta
+                    hash_of_file = hash_file(file)
+                    [doci.metadata.update(source=file, source_true=file_llava, hashid=hash_of_file,
+                                          llava_prompt=llava_prompt or '') for doci in
+                     docs1c]
+                    docs1.extend(docs1c)
+                except BaseException as e0:
+                    print("LLaVa: %s: %s" % (str(e0), traceback.print_exception(e0)), flush=True)
+                    e = e0
+                handled |= len(docs1) > 0
+                if verbose:
+                    print("END: LLaVa", flush=True)
 
         doc1 = chunk_sources(docs1)
         if len(doc1) == 0:
@@ -6752,6 +7013,7 @@ def _run_qa_db(query=None,
                migrate_embedding_model=False,
                stream_output0=False,
                stream_output=False,
+               enable_caching=False,
                async_output=True,
                num_async=3,
                prompter=None,
@@ -6874,6 +7136,7 @@ def _run_qa_db(query=None,
                guided_choice=None,
                guided_grammar=None,
                guided_whitespace_pattern=None,
+               client_metadata=None,
 
                json_vllm=False,
 
@@ -6905,6 +7168,8 @@ def _run_qa_db(query=None,
     :param answer_with_sources
     :return:
     """
+    if client_metadata:
+        print("RUNQADB START client_metadata: %s" % client_metadata, flush=True)
     t_run = time.time()
     if LangChainAgent.SMART.value in langchain_agents:
         # FIXME: support whatever model/user supports
@@ -7023,6 +7288,7 @@ Respond to prompt of Final Answer with your final well-structured%s answer to th
                       langchain_only_model=langchain_only_model,
                       load_awq=load_awq,
                       stream_output=stream_output,
+                      enable_caching=enable_caching,
                       async_output=async_output,
                       num_async=num_async,
                       do_sample=do_sample,
@@ -7315,6 +7581,10 @@ Respond to prompt of Final Answer with your final well-structured%s answer to th
         num_prompt_tokens = llm.count_input_tokens
     else:
         num_prompt_tokens = get_token_count(prompt, tokenizer)
+    if hasattr(llm, 'count_output_tokens') and llm.count_output_tokens != 0:
+        ntokens = llm.count_output_tokens
+    else:
+        ntokens = None
 
     # ensure to close client
     # https://github.com/langchain-ai/langchain/issues/13509
@@ -7332,14 +7602,17 @@ Respond to prompt of Final Answer with your final well-structured%s answer to th
         if verbose:
             print('response: %s' % ret)
         yield dict(prompt_raw=prompt, response=ret, sources=sources, num_prompt_tokens=num_prompt_tokens,
-                   llm_answers=llm_answers, response_no_refs=ret, sources_str='')
+                   llm_answers=llm_answers, response_no_refs=ret, sources_str='', ntokens=ntokens)
     elif answer is not None:
         ret, sources, ret_no_refs, sources_str = get_sources_answer(*get_answer_args, **get_answer_kwargs)
         llm_answers['llm_answer_final'] = ret
         if verbose:
             print('response: %s' % ret)
         yield dict(prompt_raw=prompt, response=ret, sources=sources, num_prompt_tokens=num_prompt_tokens,
-                   llm_answers=llm_answers, response_no_refs=ret_no_refs, sources_str=sources_str)
+                   llm_answers=llm_answers, response_no_refs=ret_no_refs, sources_str=sources_str,
+                   ntokens=ntokens)
+    if client_metadata:
+        print("RUNQADB FINISH client_metadata: %s" % client_metadata, flush=True)
     return
 
 

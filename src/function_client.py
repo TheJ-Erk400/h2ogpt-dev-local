@@ -52,7 +52,7 @@ def call_function_server(host, port, function_name, args, kwargs, use_disk=False
     if "error" in execute_result:
         raise RuntimeError(execute_result['error'])
     else:
-        if use_disk:
+        if use_disk or use_pickle:
             file_path = execute_result["file_path"]
             result_from_disk = read_result_from_disk(file_path, use_pickle, verbose=verbose)
             return result_from_disk
@@ -60,17 +60,20 @@ def call_function_server(host, port, function_name, args, kwargs, use_disk=False
             return execute_result["result"]
 
 
-def get_data_h2ogpt(file, file_type, file_path, verbose=False):
+def get_data_h2ogpt(file_path, verbose=False, is_url=False, **kwargs):
     """
     Simple function for Open Web UI
     """
     function_server_host = os.getenv('H2OGPT_FUNCTION_SERVER_HOST', '0.0.0.0')
-    function_server_port = int(os.getenv('H2OGPT_FUNCTION_SERVER_PORT', '5003'))
+    function_server_port = int(os.getenv('H2OGPT_FUNCTION_SERVER_PORT', '5002'))
     function_api_key = os.getenv('H2OGPT_FUNCTION_SERVER_API_KEY', 'EMPTY')
 
     # could set other things:
     # https://github.com/h2oai/h2ogpt/blob/d2fa3d7ce507e8fb141c78ff92a83a8e27cf8b31/src/gpt_langchain.py#L9498
-    simple_kwargs = {}
+    simple_kwargs = kwargs
+    if is_url:
+        simple_kwargs.update(dict(filei=None, url=file_path, text=None))
+        file_path = None
     function_name = 'path_to_docs'
     use_disk = False
     use_pickle = True

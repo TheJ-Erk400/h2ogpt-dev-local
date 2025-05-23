@@ -159,6 +159,10 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
                  'extract_frames': 10,
                  'visible_models': None,
                  'visible_image_models': None,
+                 'image_size': None,
+                 'image_quality': None,
+                 'image_guidance_scale': None,
+                 'image_num_inference_steps': None,
                  'h2ogpt_key': None,
                  'chat_conversation': None,
                  'text_context_list': None,
@@ -190,6 +194,7 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
                  'guided_choice': '',
                  'guided_grammar': '',
                  'guided_whitespace_pattern': None,
+                 'client_metadata': None,
                  }
     if cpu and bits == 32:
         expected1.update({'image_audio_loaders': np.array([], dtype=object)})

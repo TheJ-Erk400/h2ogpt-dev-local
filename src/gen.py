@@ -61,7 +61,8 @@ from db_utils import fetch_user
 from model_utils import switch_a_roo_llama, get_score_model, get_model_retry, get_model, \
     get_client_from_inference_server, model_lock_to_state
 
-from evaluate_params import eval_func_param_names, no_default_param_names, input_args_list
+from evaluate_params import eval_func_param_names, no_default_param_names, input_args_list, image_size_default, \
+    image_quality_choices
 from enums import DocumentSubset, LangChainMode, no_lora_str, no_model_str, \
     LangChainAction, LangChainAgent, DocumentChoice, LangChainTypes, super_source_prefix, \
     super_source_postfix, t5_type, get_langchain_prompts, gr_to_lg, invalid_key_msg, docs_joiner_default, \
@@ -78,7 +79,8 @@ from enums import DocumentSubset, LangChainMode, no_lora_str, no_model_str, \
     is_json_model, is_vision_model, \
     model_state_none0, other_model_state_defaults0, image_batch_image_prompt0, image_batch_final_prompt0, \
     tokens_per_image, openai_supports_functiontools, openai_supports_parallel_functiontools, does_support_functiontools, \
-    json_object_post_prompt_reminder0, json_code_post_prompt_reminder0, json_code2_post_prompt_reminder0
+    json_object_post_prompt_reminder0, json_code_post_prompt_reminder0, json_code2_post_prompt_reminder0, \
+    max_stream_string_for_json
 
 from utils import set_seed, clear_torch_cache, NullContext, wrapped_partial, EThread, get_githash, \
     import_matplotlib, get_device, makedirs, get_kwargs, start_faulthandler, get_hf_server, \
@@ -233,6 +235,7 @@ def main(
         text_context_list: typing.List[str] = None,
 
         stream_output: bool = True,
+        enable_caching: bool = False,
         async_output: bool = True,
         num_async: int = 3,
         stream_map: bool = False,
@@ -523,6 +526,10 @@ def main(
 
         enable_image: bool = False,
         visible_image_models: typing.List[str] = [],
+        image_size: str = image_size_default,
+        image_quality: str = 'standard',
+        image_guidance_scale: float = 3.0,
+        image_num_inference_steps: int = 30,
         image_gpu_ids: typing.List[Union[str, int]] = None,
         enable_llava_chat: bool = False,
 
@@ -535,6 +542,7 @@ def main(
 
         enable_heap_analytics: bool = True,
         heap_app_id: str = "1680123994",
+        client_metadata: str = '',
 
         cert_lookup_directory: str = "/etc/ssl/more-certs",
 ):
@@ -839,6 +847,7 @@ def main(
            Forces LangChain code path and uses as many entries in list as possible given max_seq_len, with first assumed to be most relevant and to go near prompt.
 
     :param stream_output: whether to stream output
+    :param enable_caching: whether to enable caching (Only for anthropic)
     :param async_output: Whether to do asyncio handling
            For summarization
            Applicable to HF TGI server
@@ -1357,6 +1366,10 @@ def main(
 
     :param enable_image: Whether to enable image generation model
     :param visible_image_models: Which image gen models to include
+    :param image_size
+    :param image_quality
+    :param image_guidance_scale
+    :param image_num_inference_steps
     :param image_gpu_ids: GPU ids to use for each visible image model
 
     :param enable_llava_chat: Whether to use LLaVa model to chat directly against instead of just for ingestion
@@ -1398,6 +1411,8 @@ def main(
     tts_action_phrases = str_to_list(tts_action_phrases)
     tts_stop_phrases = str_to_list(tts_stop_phrases)
     visible_image_models = str_to_list(visible_image_models)
+    if not image_size:
+        image_size = image_size_default
     image_gpu_ids = str_to_list(image_gpu_ids)
     document_choice = str_to_list(document_choice)
     visible_models = str_to_list(visible_models, allow_none=True)  # None means first model
@@ -1939,7 +1954,7 @@ def main(
                             inference_server,
                             llamacpp_dict,
                             chat,
-                            stream_output, show_examples,
+                            stream_output, enable_caching, show_examples,
                             prompt_type, prompt_dict, chat_template,
                             system_prompt,
                             pre_prompt_query, prompt_query,
@@ -2006,6 +2021,7 @@ def main(
                             guided_choice,
                             guided_grammar,
                             guided_whitespace_pattern,
+                            client_metadata,
 
                             verbose,
                             )
@@ -2449,6 +2465,7 @@ def evaluate(
         iinput,
         context,
         stream_output,
+        enable_caching,
         prompt_type,
         prompt_dict,
         chat_template,
@@ -2512,6 +2529,10 @@ def evaluate(
         llava_prompt,
         visible_models,
         visible_image_models,
+        image_size,
+        image_quality,
+        image_guidance_scale,
+        image_num_inference_steps,
         h2ogpt_key,
         add_search_to_context,
 
@@ -2555,6 +2576,7 @@ def evaluate(
         guided_whitespace_pattern,
 
         model_lock,  # not really used by evaluate, just pure API
+        client_metadata,
 
         # END NOTE: Examples must have same order of parameters
         captions_model=None,
@@ -2657,6 +2679,8 @@ def evaluate(
 
         stream_map=None,
 ):
+    if client_metadata:
+        print(f"evaluate start client_metadata: {client_metadata}", flush=True)
     # ensure passed these
     assert concurrency_count is not None
     assert memory_restriction_level is not None
@@ -2713,6 +2737,8 @@ def evaluate(
 
     chat_conversation = str_to_list(chat_conversation)
     text_context_list = str_to_list(text_context_list)
+    if not image_size:
+        imag_size = image_size_default
 
     langchain_modes = selection_docs_state['langchain_modes']
     langchain_mode_paths = selection_docs_state['langchain_mode_paths']
@@ -2742,6 +2768,10 @@ def evaluate(
         image_file_gen = make_image(instruction,
                                     filename=os.path.join(gradio_tmp, filename_image),
                                     pipe=pipe,
+                                    image_size=image_size,
+                                    image_quality=image_quality,
+                                    image_guidance_scale=float(image_guidance_scale),
+                                    image_num_inference_steps=int(image_num_inference_steps),
                                     )
         response = (image_file_gen,)
         # FIXME: Could run this through image model if was selected
@@ -2754,6 +2784,8 @@ def evaluate(
         yield dict(response=response, sources=[], save_dict=save_dict, llm_answers=dict(response_raw=''),
                    response_no_refs="Generated image for %s" % instruction,
                    sources_str="", prompt_raw=instruction)
+        if client_metadata:
+            print(f"evaluate finish image client_metadata: {client_metadata}", flush=True)
         return
 
     no_model_msg = "Please choose a base model with --base_model (CLI) or load in Models Tab (gradio).\n" \
@@ -2884,12 +2916,19 @@ def evaluate(
     # Note: Could do below, but for now gradio way can control do_sample directly
     # elif temperature >= 0.01:
     #     do_sample = True
+
     max_input_tokens = int(max_input_tokens) if max_input_tokens is not None else -1
     max_total_input_tokens = int(max_total_input_tokens) if max_total_input_tokens is not None else -1
     # FIXME: https://github.com/h2oai/h2ogpt/issues/106
     num_beams = 1 if stream_output else num_beams  # See max_beams in gradio_runner
     if model_lower == 'distilgpt2':
         # always truncate for certain models that totally fail otherwise
+        truncation_generation = True
+    if not inference_server:
+        # can listen to truncation_generation
+        pass
+    else:
+        # these don't support allowing going beyond total context
         truncation_generation = True
     max_max_new_tokens = get_max_max_new_tokens(chosen_model_state,
                                                 memory_restriction_level=memory_restriction_level,
@@ -2942,11 +2981,30 @@ def evaluate(
     if force_streaming_on_to_handle_timeouts:
         stream_output = gradio and num_beams == 1
 
+    # https://platform.openai.com/docs/guides/reasoning/beta-limitations
+    if base_model in ['o1-mini', 'o1-preview'] and os.getenv('O1STREAM', '0') == '0':
+        stream_output = False
+
     from gradio_utils.grclient import GradioClient
     from gradio_client import Client
     gradio_server = inference_server.startswith('http') and (
             isinstance(model, GradioClient) or isinstance(model, Client))
     h2ogpt_gradio_server = gradio_server and not is_gradio_vision_model(base_model)
+
+    if image_file and hasattr(tokenizer, 'chat_template') and isinstance(tokenizer.chat_template,
+                                                                         str) and tokenizer.chat_template:
+        if 'Prompting with images is incompatible with system messages' in tokenizer.chat_template:
+            system_prompt_xml = f"""\n<system_prompt>\n{system_prompt}\n</system_prompt>\n""" if system_prompt else ''
+            if instruction and system_prompt_xml:
+                if '<system_prompt>' not in instruction:
+                    instruction = system_prompt_xml + '\n\n' + instruction
+            else:
+                if system_prompt_xml:
+                    if '<system_prompt>' not in prompt_query:
+                        prompt_query = system_prompt_xml + prompt_query
+                    if '<system_prompt>' not in prompt_summary:
+                        prompt_summary = system_prompt_xml + prompt_summary
+            system_prompt = ''
 
     if guided_json == '':
         guided_json = None
@@ -3225,6 +3283,7 @@ def evaluate(
         prompt_basic = prompter.generate_prompt(data_point, context_from_history=False, image_file=image_file)
         prompt = prompt_basic
         num_prompt_tokens = 0
+        ntokens = None
         llm_answers = {}
         for r in run_qa_db(
                 inference_server=inference_server,
@@ -3274,6 +3333,7 @@ def evaluate(
                 context=context,
                 stream_output0=stream_output0,
                 stream_output=stream_output,
+                enable_caching=enable_caching,
                 chunk=chunk,
                 chunk_size=chunk_size,
 
@@ -3370,6 +3430,7 @@ def evaluate(
                 guided_choice=guided_choice,
                 guided_grammar=guided_grammar,
                 guided_whitespace_pattern=guided_whitespace_pattern,
+                client_metadata=client_metadata,
 
                 json_vllm=json_vllm,
 
@@ -3383,9 +3444,12 @@ def evaluate(
             response = r['response']
             if response_format in ['json_object', 'json_code']:
                 response_raw = response
-                response = get_json(response, json_schema_type=json_schema_type)
+                # this can get expensive if long, so only do if small, else do only at end
+                if len(str(response)) < max_stream_string_for_json:
+                    response = get_json(response, json_schema_type=json_schema_type)
             sources = r['sources']
             num_prompt_tokens = r['num_prompt_tokens']
+            ntokens = r.get('ntokens')
             llm_answers = r['llm_answers']
             llm_answers['response_raw'] = response_raw
             response_no_refs = r['response_no_refs']
@@ -3399,7 +3463,11 @@ def evaluate(
                                # tokens_persecond computed in save_generate_output
                                sources_str=sources_str,
                                sources=sources,
+                               ntokens=ntokens,
                                ))
+        if response_format in ['json_object', 'json_code']:
+            # always do at end, in case didn't before due to length
+            response = get_json(response, json_schema_type=json_schema_type)
         save_dict.update(dict(prompt=prompt, output=response, where_from="run_qa_db", extra_dict=extra_dict))
         yield dict(response=response, sources=sources, save_dict=save_dict, llm_answers=llm_answers,
                    response_no_refs=response_no_refs, sources_str=sources_str, prompt_raw=prompt_raw)
@@ -3413,8 +3481,12 @@ def evaluate(
             # so nothing to give to LLM), then slip through and ask LLM
             # Or if llama/gptj, then just return since they had no response and can't go down below code path
             # don't clear torch cache here, delays multi-generation, and bot(), all_bot(), and evaluate_nochat() do it
+            if client_metadata:
+                print(f"evaluate finish run_qa_db client_metadata: {client_metadata}", flush=True)
             return
 
+    if client_metadata:
+        print(f"evaluate middle non-langchain client_metadata: {client_metadata}", flush=True)
     # NOT LANGCHAIN PATH, raw LLM
     # restrict instruction + , typically what has large input
     prompt, \
@@ -3488,9 +3560,20 @@ def evaluate(
                                      n=num_return_sequences,
                                      presence_penalty=(repetition_penalty - 1.0) * 2.0 + 0.0,  # so good default
                                      )
+            if base_model in ['o1-mini', 'o1-preview']:
+                gen_server_kwargs['max_completion_tokens'] = gen_server_kwargs.pop('max_tokens')
+                max_reasoning_tokens = int(os.getenv("MAX_REASONING_TOKENS", 25000))
+                gen_server_kwargs['max_completion_tokens'] = max_reasoning_tokens + max(100, gen_server_kwargs[
+                    'max_completion_tokens'])
+                gen_server_kwargs['temperature'] = 1.0
+                gen_server_kwargs.pop('presence_penalty', None)
+                gen_server_kwargs.pop('n', None)
+                gen_server_kwargs.pop('frequency_penalty', None)
+                gen_server_kwargs.pop('top_p', None)
             try:
                 if inf_type in ['vllm', 'vllm_chat'] and chosen_model_state['json_vllm']:
-                    response_format_real = response_format if guided_json and response_format == 'json_object' else 'text'
+                    response_format_real = response_format if not (
+                            guided_json or guided_regex or guided_choice or guided_grammar) else 'text'
                     vllm_extra_dict = get_vllm_extra_dict(tokenizer, stop_sequences=stop_sequences,
                                                           response_format=response_format_real,
                                                           guided_json=guided_json,
@@ -3520,6 +3603,8 @@ def evaluate(
                     response_raw = ''
                     if not stream_output:
                         text = responses.choices[0].text
+                        if hasattr(responses, 'usage'):
+                            print(f"Usage by {base_model}: {responses.usage}")
                         response = prompter.get_response(prompt + text, prompt=prompt,
                                                          sanitize_bot_response=sanitize_bot_response)
                         if response_format in ['json_object', 'json_code']:
@@ -3536,7 +3621,8 @@ def evaluate(
                                                                  sanitize_bot_response=sanitize_bot_response)
                                 if response_format in ['json_object', 'json_code']:
                                     response_raw = response
-                                    response = get_json(response, json_schema_type=json_schema_type)
+                                    if len(str(response)) < max_stream_string_for_json:
+                                        response = get_json(response, json_schema_type=json_schema_type)
                                 yield dict(response=response, sources=sources, save_dict={},
                                            llm_answers=dict(response_raw=response_raw),
                                            response_no_refs=response, sources_str='', prompt_raw='')
@@ -3545,6 +3631,12 @@ def evaluate(
                                     print("Took too long for OpenAI or VLLM: %s" % (time.time() - tgen0), flush=True)
                                 break
                             time.sleep(0.005)
+                        if response_format in ['json_object', 'json_code']:
+                            # always do at end, in case didn't before due to length
+                            response = get_json(response, json_schema_type=json_schema_type)
+                            yield dict(response=response, sources=sources, save_dict={},
+                                       llm_answers=dict(response_raw=response_raw),
+                                       response_no_refs=response, sources_str='', prompt_raw='')
                 elif inf_type in ['vllm_chat', 'openai_chat']:
                     other_dict = dict(timeout=max_time)
                     if system_prompt in [None, 'None', 'auto']:
@@ -3604,7 +3696,8 @@ def evaluate(
                         response = text
                         if response_format in ['json_object', 'json_code']:
                             response_raw = response
-                            response = get_json(response, json_schema_type=json_schema_type)
+                            if len(str(response)) < max_stream_string_for_json:
+                                response = get_json(response, json_schema_type=json_schema_type)
                     else:
                         # NOTE: If some stream failure like wrong model, don't get back response and no failure
                         tgen0 = time.time()
@@ -3624,6 +3717,12 @@ def evaluate(
                                     print("Took too long for OpenAI or VLLM Chat: %s" % (time.time() - tgen0),
                                           flush=True)
                                 break
+                        if response_format in ['json_object', 'json_code']:
+                            # always do at end, in case didn't before due to length
+                            response = get_json(response, json_schema_type=json_schema_type)
+                            yield dict(response=response, sources=sources, save_dict={},
+                                       llm_answers=dict(response_raw=response_raw),
+                                       response_no_refs=response, sources_str='', prompt_raw='')
                 else:
                     raise RuntimeError("No such OpenAI mode: %s" % inference_server)
             finally:
@@ -3706,7 +3805,8 @@ def evaluate(
                     for response1 in get_llava_stream(**llava_kwargs):
                         if response_format in ['json_object', 'json_code']:
                             response_raw = response1
-                            response = get_json(response1, json_schema_type=json_schema_type)
+                            if len(str(response)) < max_stream_string_for_json:
+                                response = get_json(response1, json_schema_type=json_schema_type)
                         else:
                             response = response1
                         yield dict(response=response, sources=[], save_dict={}, error='',
@@ -3717,7 +3817,12 @@ def evaluate(
                             if verbose:
                                 print("Took too long for TGI: %s" % (time.time() - tgen0), flush=True)
                             break
-
+                    if response_format in ['json_object', 'json_code']:
+                        # always do at end, in case didn't before due to length
+                        response = get_json(response, json_schema_type=json_schema_type)
+                        yield dict(response=response, sources=sources, save_dict={},
+                                   llm_answers=dict(response_raw=response_raw),
+                                   response_no_refs=response, sources_str='', prompt_raw='')
             else:
                 if gr_client is not None:
                     # Note: h2oGPT gradio server could handle input token size issues for prompt,
@@ -3784,6 +3889,7 @@ def evaluate(
                                          # streaming output is supported, loops over and outputs each generation in streaming mode
                                          # but leave stream_output=False for simple input/output mode
                                          stream_output=stream_output,
+                                         enable_caching=enable_caching,
 
                                          **gen_server_kwargs,
 
@@ -3843,6 +3949,10 @@ def evaluate(
                                          llava_prompt=llava_prompt,
                                          visible_models=visible_models,
                                          visible_image_models=visible_image_models,
+                                         image_size=image_size,
+                                         image_quality=image_quality,
+                                         image_guidance_scale=image_guidance_scale,
+                                         image_num_inference_steps=image_num_inference_steps,
                                          h2ogpt_key=h2ogpt_key,
                                          add_search_to_context=client_add_search_to_context,
                                          docs_ordering_type=docs_ordering_type,
@@ -3878,6 +3988,7 @@ def evaluate(
                                          guided_whitespace_pattern=guided_whitespace_pattern,
 
                                          model_lock=None,  # already set
+                                         client_metadata=client_metadata,
                                          )
                     assert len(set(list(client_kwargs.keys())).symmetric_difference(eval_func_param_names)) == 0
                     api_name = '/submit_nochat_api'  # NOTE: like submit_nochat but stable API for string dict passing
@@ -3909,16 +4020,27 @@ def evaluate(
                             gener = gr_client.simple_stream(**gr_stream_kwargs)
                         response = ''
                         response_raw = ''
-                        for res_dict in gener:
-                            if 'response' in res_dict:
-                                response = res_dict['response']
+                        res_dict = {}
+                        for res_dict1 in gener:
+                            if 'response' in res_dict1:
+                                response = res_dict1['response']
                                 if response_format in ['json_object', 'json_code']:
                                     response_raw = response
-                                    response = get_json(response, json_schema_type=json_schema_type)
-                                    res_dict['response'] = response
-                                    res_dict['llm_answers'] = res_dict.get('llm_answers', {})
-                                    res_dict['llm_answers']['response_raw'] = response_raw
+                                    if len(str(response)) < max_stream_string_for_json:
+                                        response = get_json(response, json_schema_type=json_schema_type)
+                                    res_dict1['response'] = response
+                                    res_dict1['llm_answers'] = res_dict1.get('llm_answers', {})
+                                    res_dict1['llm_answers']['response_raw'] = response_raw
+                            res_dict = res_dict1
+                            yield res_dict1
+                        if response_format in ['json_object', 'json_code']:
+                            # always do at end, in case didn't before due to length
+                            response = get_json(response, json_schema_type=json_schema_type)
+                            res_dict['response'] = response
+                            res_dict['llm_answers'] = res_dict.get('llm_answers', {})
+                            res_dict['llm_answers']['response_raw'] = response_raw
                             yield res_dict
+
                     # listen to inner gradio
                     num_prompt_tokens += res_dict.get('save_dict', {}).get('extra_dict', {}).get('num_prompt_tokens',
                                                                                                  num_prompt_tokens)
@@ -3976,7 +4098,8 @@ def evaluate(
                                 sources = []
                                 if response_format in ['json_object', 'json_code']:
                                     response_raw = response
-                                    response = get_json(response, json_schema_type=json_schema_type)
+                                    if len(str(response)) < max_stream_string_for_json:
+                                        response = get_json(response, json_schema_type=json_schema_type)
                                 yield dict(response=response, sources=sources, save_dict={},
                                            llm_answers=dict(response_raw=response_raw),
                                            response_no_refs=response, sources_str='', prompt_raw='')
@@ -3985,6 +4108,12 @@ def evaluate(
                                 if verbose:
                                     print("Took too long for TGI: %s" % (time.time() - tgen0), flush=True)
                                 break
+                        if response_format in ['json_object', 'json_code']:
+                            # always do at end, in case didn't before due to length
+                            response = get_json(response, json_schema_type=json_schema_type)
+                            yield dict(response=response, sources=sources, save_dict={},
+                                       llm_answers=dict(response_raw=response_raw),
+                                       response_no_refs=response, sources_str='', prompt_raw='')
                 else:
                     raise RuntimeError("Failed to get client: %s" % inference_server)
             if isinstance(model, GradioClient) and not regenerate_gradio_clients and gr_client is not None:
@@ -3996,10 +4125,11 @@ def evaluate(
 
         # only return yield with save_dict and prompt_raw here to keep streaming light
         extra_dict.update(gen_server_kwargs)
+        ntokens = extra_dict.get('ntokens', None)
         extra_dict.update(dict(inference_server=inference_server,  # changes in some cases
                                num_prompt_tokens=num_prompt_tokens,
                                t_generate=time.time() - t_generate,
-                               ntokens=None,
+                               ntokens=ntokens,
                                prompt_type=prompt_type,
                                tokens_persecond=None,
                                ))
@@ -4007,6 +4137,8 @@ def evaluate(
         # if not streaming, only place yield should be done
         yield dict(response=response, sources=sources, save_dict=save_dict, llm_answers=dict(response_raw=response_raw),
                    response_no_refs=response, sources_str='', prompt_raw=prompt)
+        if client_metadata:
+            print(f"evaluate finish inference server client_metadata: {client_metadata}", flush=True)
         return
     else:
         assert not inference_server, "inference_server=%s not supported" % inference_server
@@ -4171,7 +4303,8 @@ def evaluate(
                                                              sanitize_bot_response=sanitize_bot_response)
                             if response_format in ['json_object', 'json_code']:
                                 response_raw = response
-                                response = get_json(response, json_schema_type=json_schema_type)
+                                if len(str(response)) < max_stream_string_for_json:
+                                    response = get_json(response, json_schema_type=json_schema_type)
                             ret = dict(response=response, sources=sources, save_dict=save_dict,
                                        llm_answers=dict(response_raw=response_raw),
                                        response_no_refs=response, sources_str='', prompt_raw=prompt)
@@ -4181,6 +4314,11 @@ def evaluate(
                                 if verbose:
                                     print("Took too long for Torch: %s" % (time.time() - tgen0), flush=True)
                                 break
+                        if response_format in ['json_object', 'json_code']:
+                            response = get_json(response, json_schema_type=json_schema_type)
+                            ret = dict(response=response, sources=sources, save_dict=save_dict,
+                                       llm_answers=dict(response_raw=response_raw),
+                                       response_no_refs=response, sources_str='', prompt_raw=prompt)
                         if stream_output:
                             # will yield at end if required
                             # yield if anything left over as can happen (FIXME: Understand better)
@@ -4243,6 +4381,8 @@ def evaluate(
             if verbose:
                 print('Post-Generate: %s decoded_output: %s' % (
                     str(datetime.now()), len(decoded_output) if decoded_output else -1), flush=True)
+    if client_metadata:
+        print(f"evaluate HF finish client_metadata: {client_metadata}", flush=True)
 
 
 inputs_list_names = list(inspect.signature(evaluate).parameters)
@@ -4399,7 +4539,7 @@ def get_generate_params(model_lower,
                         inference_server,
                         llamacpp_dict,
                         chat,
-                        stream_output, show_examples,
+                        stream_output, enable_caching, show_examples,
                         prompt_type, prompt_dict, chat_template,
                         system_prompt,
                         pre_prompt_query, prompt_query,
@@ -4463,6 +4603,7 @@ def get_generate_params(model_lower,
                         guided_choice,
                         guided_grammar,
                         guided_whitespace_pattern,
+                        client_metadata,
 
                         verbose,
                         ):
@@ -4586,7 +4727,7 @@ Philipp: ok, ok you can find everything here. https://huggingface.co/blog/the-pa
         do_sample = False if do_sample is None else do_sample
     # doesn't include chat, instruction_nochat, iinput_nochat, added later
     params_list = ["",
-                   stream_output,
+                   stream_output, enable_caching,
                    prompt_type, prompt_dict, chat_template,
                    temperature, top_p, top_k, penalty_alpha, num_beams,
                    max_new_tokens, min_new_tokens,
@@ -4668,12 +4809,16 @@ y = np.random.randint(0, 1, 100)
                     jq_schema,
                     extract_frames,
                     llava_prompt,
-                    None,
-                    None,
-                    None,
-                    False,
-                    None,
-                    None,
+                    None,  # visible_models
+                    None,  # visible_image_models
+                    image_size_default,  # image_size
+                    image_quality_choices[0],  # image_quality
+                    3.0,  # image_guidance_scale
+                    30,  # image_num_inference_steps
+                    None,  # h2ogpt_key
+                    False,  # add_search_to_context
+                    None,  # chat_conversation
+                    None,  # text_context_list
                     docs_ordering_type,
                     min_max_new_tokens,
                     max_input_tokens,
@@ -4709,8 +4854,8 @@ y = np.random.randint(0, 1, 100)
                     guided_choice,
                     guided_grammar,
                     guided_whitespace_pattern,
-
                     None,  # model_lock, only client, don't need default value
+                    client_metadata,
                     ]
         # adjust examples if non-chat mode
         if not chat:
@@ -5139,13 +5284,15 @@ def get_limited_prompt(instruction,
 
     if use_chat_template:
         # see if chat template handles system prompt
-        if system_prompt in apply_chat_template("Test", system_prompt, [], [],
+        if system_prompt in apply_chat_template("Test", system_prompt, [],
                                                 tokenizer,
+                                                image_file=[],
                                                 test_only=True, user_prompt_for_fake_system_prompt=None):
             can_handle_system_prompt = True
 
-        base_size = len(apply_chat_template("Test", None, [], [],
+        base_size = len(apply_chat_template("Test", None, [],
                                             tokenizer,
+                                            image_file=[],
                                             test_only=True, user_prompt_for_fake_system_prompt=None))
     else:
         base_size = 0
@@ -5228,8 +5375,9 @@ def get_limited_prompt(instruction,
     ###########################
     # get context2 without history or system_prompt
     if use_chat_template:
-        context2 = apply_chat_template(instruction, '', [], image_file,
+        context2 = apply_chat_template(instruction, '', [],
                                        tokenizer,
+                                       image_file=image_file,
                                        user_prompt_for_fake_system_prompt=user_prompt_for_fake_system_prompt)
         iinput = ''
         context1 = ''
@@ -5307,8 +5455,9 @@ def get_limited_prompt(instruction,
             history_to_use = history[0 + chat_index:]
 
         if use_chat_template:
-            context2 = apply_chat_template(instruction, system_prompt, history_to_use, image_file,
+            context2 = apply_chat_template(instruction, system_prompt, history_to_use,
                                            tokenizer,
+                                           image_file=image_file,
                                            user_prompt_for_fake_system_prompt=user_prompt_for_fake_system_prompt)
         else:
             context2, history_to_use = history_to_context_func(history_to_use, system_prompt=system_prompt)
@@ -5339,8 +5488,9 @@ def get_limited_prompt(instruction,
     ###########################
     # get final context2
     if use_chat_template:
-        context2 = apply_chat_template(instruction, system_prompt, history_to_use_final, image_file,
+        context2 = apply_chat_template(instruction, system_prompt, history_to_use_final,
                                        tokenizer,
+                                       image_file=image_file,
                                        user_prompt_for_fake_system_prompt=user_prompt_for_fake_system_prompt)
         # now context2 has system tokens
         num_system_tokens = 0

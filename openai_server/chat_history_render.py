@@ -2,13 +2,15 @@ import re
 import textwrap
 from typing import List, Dict
 
+markdown_mark = "---"
+
 
 def chat_to_pretty_markdown(
-    chat_history: List[Dict[str, str]],
-    cute=False,
-    assistant_name="Executor Agent",
-    user_name="Coder Agent",
-    dummy_name="Agent",
+        chat_history: List[Dict[str, str]],
+        cute=False,
+        assistant_name="Executor Agent",
+        user_name="Coder Agent",
+        dummy_name="Agent",
 ) -> str:
     markdown = ""
     for i, message in enumerate(chat_history):
@@ -24,7 +26,7 @@ def chat_to_pretty_markdown(
 
         # Add a horizontal rule between messages (except before the first one)
         if i > 0:
-            markdown += "---\n\n"
+            markdown += f"{markdown_mark}\n\n"
 
         # Add an emoji based on the role
         emoji = (
@@ -41,6 +43,24 @@ def chat_to_pretty_markdown(
             if role.lower() == "user"
             else dummy_name
         )
+        # If there is agent name mentioned, update the role and the emoji
+        if 'name' in message and message['name']:
+            # turns 'chat_agent' to 'Chat Agent'
+            real_role = message['name']
+            real_role = ' '.join(word.capitalize() for word in real_role.split('_'))
+
+            if message['name'] == 'chat_agent':
+                # put bubble emoji for chat agent
+                emoji = "💬"
+            if message['name'] == 'human_proxy_agent':
+                # put human emoji for human proxy agent
+                emoji = "👤"
+            if message['name'] == 'code_writer_agent':
+                # put code emoji for code writer agent
+                emoji = "🤖"
+            if message['name'] == 'code_executor_agent':
+                # put code emoji for code executor agent
+                emoji = "🧠"
 
         # Format the role
         if cute:
@@ -91,11 +111,11 @@ def wrap_long_lines(line: str, max_width: int = 80) -> str:
 
 
 def chat_to_pretty_markdown_simple(
-    chat_history,
-    cute=False,
-    assistant_name="Executor Agent",
-    user_name="Coder Agent",
-    dummy_name="Agent",
+        chat_history,
+        cute=False,
+        assistant_name="Executor Agent",
+        user_name="Coder Agent",
+        dummy_name="Agent",
 ) -> str:
     # markdown = "# Chat History\n\n"
     markdown = ""
@@ -112,7 +132,7 @@ def chat_to_pretty_markdown_simple(
 
         # Add a horizontal rule between messages (except before the first one)
         if i > 0:
-            markdown += "---\n\n"
+            markdown += f"{markdown_mark}\n\n"
 
         # Add an emoji based on the role
         emoji = (
@@ -129,6 +149,24 @@ def chat_to_pretty_markdown_simple(
             if role.lower() == "user"
             else dummy_name
         )
+        # If there is agent name mentioned, update the role and the emoji
+        if 'name' in message and message['name']:
+            # turns 'chat_agent' to 'Chat Agent'
+            real_role = message['name']
+            real_role = ' '.join(word.capitalize() for word in real_role.split('_'))
+
+            if message['name'] == 'chat_agent':
+                # put bubble emoji for chat agent
+                emoji = "💬"
+            if message['name'] == 'human_proxy_agent':
+                # put human emoji for human proxy agent
+                emoji = "👤"
+            if message['name'] == 'code_writer_agent':
+                # put code emoji for code writer agent
+                emoji = "🤖"
+            if message['name'] == 'code_executor_agent':
+                # put code emoji for code executor agent
+                emoji = "🧠"
 
         # Format the role
         if cute:

@@ -145,7 +145,7 @@ def execute_function(request: FunctionRequest):
         # Call the function with args and kwargs
         result = func(*request.args, **request.kwargs, **func_kwargs)
 
-        if request.use_disk:
+        if request.use_disk or request.use_pickle:
             # Save the result to a file on the shared disk
             base_path = 'function_results'
             if not os.path.isdir(base_path):
@@ -159,7 +159,7 @@ def execute_function(request: FunctionRequest):
                 file_path += '.json'
                 with open(file_path, "w") as f:
                     json.dump(result, f)
-            return {"status": "success", "file_path": file_path}
+            return {"status": "success", "file_path": os.path.abspath(file_path)}
         else:
             # Return the result directly
             return {"status": "success", "result": result}
@@ -173,7 +173,7 @@ def execute_function(request: FunctionRequest):
 def do_check(in_finally=False):
     health_result = check_some_conditions()
     if not health_result:
-        print("Health check failed! Terminating without cleanup (to avoid races) %s..."% in_finally)
+        print("Health check failed! Terminating without cleanup (to avoid races) %s..." % in_finally)
         if os.getenv('multiple_workers_gunicorn'):
             os._exit(1)
 
@@ -191,6 +191,7 @@ if state_checks:
                 print("Checking health...")
             await asyncio.sleep(120)  # Wait for 2 minutes between checks
             do_check(in_finally=False)
+
 
     def check_some_conditions():
         # Replace with actual health check logic

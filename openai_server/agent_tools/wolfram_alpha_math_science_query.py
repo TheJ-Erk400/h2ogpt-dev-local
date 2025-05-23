@@ -69,7 +69,8 @@ def extract_and_save_images(query, app_id, output_dir):
                         print(f"  Error downloading {image_url}: {e}")
         print("</detailed_results>")
     else:
-        print("Script ran, but query was not successful. Please try a simpler input (e.g. instead of 'plot rule 30', just say 'rule 30') and try again.")
+        print(
+            "Script ran, but query was not successful. Please try a simpler input (e.g. instead of 'plot rule 30', just say 'rule 30') and try again.")
         print("Error: ", res['@error'])
 
     return saved_files
@@ -80,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract and save images and text from Wolfram Alpha based on a query.")
     parser.add_argument("-q", "--query", type=str, required=True, help="The query to send to Wolfram Alpha")
-    parser.add_argument("-o", "--output", default="wolfram_images",
+    parser.add_argument("-o", "--output_dir", "--file", default="wolfram_images",
                         help="Output directory for saved images (default: wolfram_images)")
     parser.add_argument("-a", "--appid", help="Your Wolfram Alpha App ID")
 
@@ -95,8 +96,8 @@ def main():
 
     try:
         print(f"Query: {args.query}\n")
-        saved_files = extract_and_save_images(args.query, app_id, args.output)
-        print(f"\nSummary: Saved {len(saved_files)} images to {args.output}/")
+        saved_files = extract_and_save_images(args.query, app_id, args.output_dir)
+        print(f"\nSummary: Saved {len(saved_files)} images to {args.output_dir}/")
     except Exception as e:
         print(f"An error occurred: {str(e)}")
 

@@ -1,5 +1,7 @@
 import ast
+import asyncio
 import base64
+import functools
 import io
 import json
 import os
@@ -16,7 +18,7 @@ import filelock
 import numpy as np
 
 from log import logger
-from openai_server.backend_utils import convert_messages_to_structure, convert_gen_kwargs, get_last_and_return_value
+from openai_server.backend_utils import convert_messages_to_structure, convert_gen_kwargs
 
 
 def start_faulthandler():
@@ -120,22 +122,20 @@ def get_gradio_client(user=None, verbose=False):
 
     try:
         from gradio_utils.grclient import GradioClient as Client
-        concurrent_client = True
     except ImportError:
         print("Using slower gradio API, for speed ensure gradio_utils/grclient.py exists.")
         from gradio_client import Client
-        concurrent_client = False
 
     if auth_kwargs:
         print("Getting gradio client at %s with auth" % gradio_url, flush=True)
         client = Client(gradio_url, **auth_kwargs)
-        if concurrent_client:
+        if hasattr(client, 'setup'):
             with client_lock:
                 client.setup()
     else:
         print("BEGIN: Getting non-user gradio client at %s" % gradio_url, flush=True)
         client = Client(gradio_url)
-        if concurrent_client:
+        if hasattr(client, 'setup'):
             with client_lock:
                 client.setup()
         print("END: getting non-user gradio client at %s" % gradio_url, flush=True)
@@ -183,36 +183,13 @@ def get_client(user=None):
         print("client.auth=%s" % str(gradio_client.auth), file=sys.stderr)
         try:
             new_hash = gradio_client.get_server_hash()
-            if new_hash != gradio_client0.server_hash:
-                with user_lock:
-                    gradio_client0.refresh_client()
+            assert new_hash
         except Exception as e:
             ex = traceback.format_exc()
-            print(ex, file=sys.stderr)
-            # just get fresh client
-            print("client", file=sys.stderr)
-            print(gradio_client, file=sys.stderr)
-            print("client dict", file=sys.stderr)
-            print(gradio_client.__dict__, file=sys.stderr)
-            print("get fresh client", file=sys.stderr)
-            gradio_client = get_gradio_client(user=user)
-            print("done fresh client", file=sys.stderr)
-            print("fresh client", file=sys.stderr)
-            print(gradio_client, file=sys.stderr)
-            print("fresh client dict", file=sys.stderr)
-            print(gradio_client.__dict__, file=sys.stderr)
-            print("cloning back to global", file=sys.stderr)
-            with user_lock:
-                for k, v in gradio_client.__dict__.items():
-                    setattr(gradio_client0, k, v)
-                gradio_client0.reset_session()
-
-                gradio_client.get_endpoints(gradio_client0)
-
-                # transfer internals in case used
-                gradio_client0.server_hash = gradio_client.server_hash
-                gradio_client0.chat_conversation = gradio_client.chat_conversation
-                gradio_client_list[user] = gradio_client0
+            print(f"re-getting fresh client due to exception: {ex}", file=sys.stderr)
+            # just get fresh client if any issues
+            print(f"re-getting fresh client due to exception: {str(e)}", file=sys.stderr)
+            gradio_client_list[user] = get_gradio_client(user=user, verbose=True)
     if not hasattr(gradio_client, 'clone') and not got_fresh_client:
         print(
             "re-get to ensure concurrency ok, slower if API is large, for speed ensure gradio_utils/grclient.py exists.",
@@ -262,21 +239,44 @@ def get_client(user=None):
     return gradio_client
 
 
-def get_response(instruction, gen_kwargs, verbose=False, chunk_response=True, stream_output=False):
-    import ast
-    kwargs = dict(instruction=instruction)
-    if os.getenv('GRADIO_H2OGPT_H2OGPT_KEY'):
-        kwargs.update(dict(h2ogpt_key=os.getenv('GRADIO_H2OGPT_H2OGPT_KEY')))
+def get_chunk(outputs_list, job_outputs_num, last_response, num, verbose=False):
+    res_str = outputs_list[job_outputs_num + num]
+    res_dict = ast.literal_eval(res_str)
+    if verbose:
+        logger.info('Stream %d: %s\n\n %s\n\n' % (num, res_dict['response'], res_dict))
+        logger.info('Stream %d' % (job_outputs_num + num))
+    if 'error' in res_dict and res_dict['error']:
+        raise RuntimeError(res_dict['error'])
+    elif 'error_ex' in res_dict and res_dict['error_ex']:
+        raise RuntimeError(res_dict['error_ex'])
+    elif 'response' not in res_dict:
+        raise RuntimeError("No response in res: %s" % res_dict)
+    else:
+        response = res_dict['response']
+        chunk = response[len(last_response):]
+    return chunk, response, res_dict
 
-    gen_kwargs = convert_gen_kwargs(gen_kwargs)
-    kwargs.update(**gen_kwargs)
+
+async def get_response(chunk_response=True, **kwargs):
+    assert kwargs['query'] is not None, "query must not be None"
+    import ast
+
+    stream_output = kwargs.get('stream_output', True)
+    stream_output_orig = stream_output
+    # always force streaming to avoid blocking server
+    stream_output = True
+    verbose = kwargs.get('verbose', False)
+
+    kwargs = convert_gen_kwargs(kwargs)
 
     # WIP:
     # if gen_kwargs.get('skip_gradio'):
     #    fun_with_dict_str_plain
 
     # concurrent gradio client
-    client = get_client(user=gen_kwargs.get('user'))
+    client = get_client(user=kwargs.get('user'))
+
+    res_dict = {}
 
     if stream_output:
         job = client.submit(str(dict(kwargs)), api_name='/submit_nochat_api')
@@ -286,53 +286,45 @@ def get_response(instruction, gen_kwargs, verbose=False, chunk_response=True, st
             outputs_list = job.outputs().copy()
             job_outputs_num_new = len(outputs_list[job_outputs_num:])
             for num in range(job_outputs_num_new):
-                res = outputs_list[job_outputs_num + num]
-                res = ast.literal_eval(res)
-                if verbose:
-                    logger.info('Stream %d: %s\n\n %s\n\n' % (num, res['response'], res))
-                    logger.info('Stream %d' % (job_outputs_num + num))
-                if 'error' in res and res['error']:
-                    raise RuntimeError(res['error'])
-                elif 'error_ex' in res and res['error_ex']:
-                    raise RuntimeError(res['error_ex'])
-                elif 'response' not in res:
-                    raise RuntimeError("No response in res: %s" % res)
-                else:
-                    response = res['response']
-                    chunk = response[len(last_response):]
+                chunk, response, res_dict = get_chunk(outputs_list, job_outputs_num, last_response, num,
+                                                      verbose=verbose)
+                if stream_output_orig:
+                    if chunk_response:
+                        if chunk:
+                            yield chunk
+                    else:
+                        yield response
+                last_response = response
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.005)
+            job_outputs_num += job_outputs_num_new
+
+        outputs_list = job.outputs().copy()
+        job_outputs_num_new = len(outputs_list[job_outputs_num:])
+        for num in range(job_outputs_num_new):
+            chunk, response, res_dict = get_chunk(outputs_list, job_outputs_num, last_response, num, verbose=verbose)
+            if stream_output_orig:
                 if chunk_response:
                     if chunk:
                         yield chunk
                 else:
                     yield response
-                last_response = response
-            job_outputs_num += job_outputs_num_new
-            time.sleep(0.005)
-
-        outputs_list = job.outputs().copy()
-        job_outputs_num_new = len(outputs_list[job_outputs_num:])
-        res = {}
-        for num in range(job_outputs_num_new):
-            res = outputs_list[job_outputs_num + num]
-            res = ast.literal_eval(res)
-            if verbose:
-                logger.info('Final Stream %d: %s\n\n%s\n\n' % (num, res['response'], res))
-                logger.info('Final Stream %d' % (job_outputs_num + num))
-            response = res['response']
-            chunk = response[len(last_response):]
-            if chunk_response:
-                if chunk:
-                    yield chunk
-            else:
-                yield response
             last_response = response
+            await asyncio.sleep(0.005)
         job_outputs_num += job_outputs_num_new
+        if not stream_output_orig:
+            # behave as if not streaming
+            yield res_dict['response']
         if verbose:
             logger.info("total job_outputs_num=%d" % job_outputs_num)
     else:
-        res = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
-        res = ast.literal_eval(res)
-        yield res['response']
+        res_str = client.predict(str(dict(kwargs)), api_name='/submit_nochat_api')
+        res_dict = ast.literal_eval(res_str)
+        yield res_dict['response']
+
+    # for usage
+    res_dict.pop('audio', None)
+    yield res_dict
 
 
 def split_concatenated_dicts(concatenated_dicts: str):
@@ -359,7 +351,40 @@ def split_concatenated_dicts(concatenated_dicts: str):
     return result
 
 
-def chat_completion_action(body: dict, stream_output=False) -> dict:
+def get_generator(instruction, gen_kwargs, use_agent=False, stream_output=False, verbose=False):
+    gen_kwargs['stream_output'] = stream_output
+    gen_kwargs['query'] = instruction
+    if gen_kwargs.get('verbose') is None:
+        # for local debugging
+        gen_kwargs['verbose'] = verbose
+
+    if use_agent:
+        agent_type = gen_kwargs.get('agent_type', 'auto')
+        from openai_server.agent_utils import set_dummy_term, run_agent
+        set_dummy_term()  # before autogen imported
+
+        if agent_type == 'auto':
+            agent_type = 'autogen_2agent'
+
+        if agent_type in ['autogen_2agent']:
+            from openai_server.autogen_2agent_backend import run_autogen_2agent
+            func = functools.partial(run_agent, run_agent_func=run_autogen_2agent)
+            from openai_server.autogen_utils import get_autogen_response
+            generator = get_autogen_response(func=func, **gen_kwargs)
+        elif agent_type in ['autogen_multi_agent']:
+            from openai_server.autogen_multi_agent_backend import run_autogen_multi_agent
+            func = functools.partial(run_agent, run_agent_func=run_autogen_multi_agent)
+            from openai_server.autogen_utils import get_autogen_response
+            generator = get_autogen_response(func=func, **gen_kwargs)
+        else:
+            raise ValueError("No such agent_type %s" % agent_type)
+    else:
+        generator = get_response(**gen_kwargs)
+
+    return generator
+
+
+async def achat_completion_action(body: dict, stream_output=False):
     messages = body.get('messages', [])
     object_type = 'chat.completions' if not stream_output else 'chat.completions.chunk'
     created_time = int(time.time())
@@ -367,12 +392,29 @@ def chat_completion_action(body: dict, stream_output=False) -> dict:
     resp_list = 'choices'
 
     gen_kwargs = body
-    instruction, system_message, history, image_files = convert_messages_to_structure(messages)
+    # Consecutive Autogen messages may have the same role,
+    # especially when agent_type involves group chat messages.
+    # Therefore, they need to be concatenated.
+    agent_type = gen_kwargs.get('agent_type', 'auto')
+    if agent_type == "autogen_multi_agent":
+        concat_assistant = concat_user = True
+    else:
+        concat_assistant = concat_user = False
+
+    instruction, system_message, history, image_files = convert_messages_to_structure(
+        messages=messages,
+        concat_tool=True,  # always concat tool calls
+        concat_assistant=concat_assistant,
+        concat_user=concat_user,
+    )
+    # get from messages, unless none, then try to get from gen_kwargs from extra_body
+    image_file = image_files if image_files else gen_kwargs.get('image_file', [])
+    history = history if history else gen_kwargs.get('chat_conversation', [])
     gen_kwargs.update({
         'system_prompt': system_message,
         'chat_conversation': history,
         'stream_output': stream_output,
-        'image_file': image_files,
+        'image_file': image_file,
     })
 
     use_agent = gen_kwargs.get('use_agent', False)
@@ -408,37 +450,47 @@ def chat_completion_action(body: dict, stream_output=False) -> dict:
         yield chat_streaming_chunk('')
 
     if instruction is None and gen_kwargs.get('langchain_action', '') == 'Query':
-        instruction = "Continue your response.  If your prior response was cut short, then continue exactly at end of your last response with any ellipses, else continue your response by starting with new line and proceeding with an additional useful and related response."
+        instruction = "Continue your response.  If your prior response was cut short, then continue exactly at end of your last response without any ellipses, else continue your response by starting with new line and proceeding with an additional useful and related response."
     if instruction is None:
         instruction = ''  # allowed by h2oGPT, e.g. for summarize or extract
 
-    token_count = count_tokens(instruction)
-    if use_agent:
-        from openai_server.agent_backend import get_agent_response
-        generator = get_agent_response(instruction, gen_kwargs, chunk_response=stream_output,
-                                       stream_output=stream_output)
-    else:
-        generator = get_response(instruction, gen_kwargs, chunk_response=stream_output,
-                                 stream_output=stream_output)
+    generator = get_generator(instruction, gen_kwargs, use_agent=use_agent, stream_output=stream_output)
 
     answer = ''
     usage = {}
-    try:
-        while True:
-            chunk = next(generator)
-            if stream_output:
-                answer += chunk
-                chat_chunk = chat_streaming_chunk(chunk)
-                yield chat_chunk
+    async for chunk in generator:
+        if stream_output:
+            if isinstance(chunk, dict):
+                usage.update(chunk)
             else:
+                chat_chunk = chat_streaming_chunk(chunk)
+                answer += chunk
+                yield chat_chunk
+        else:
+            if isinstance(chunk, dict):
+                usage.update(chunk)
+                if 'response' in chunk:
+                    # wil use this if exists
+                    answer = chunk['response']
+                else:
+                    answer = ''
+            else:
+                # will use this first if exists
                 answer = chunk
-    except StopIteration as e:
-        ret_dict = e.value
-        if isinstance(ret_dict, dict):
-            usage.update(ret_dict)
+        await asyncio.sleep(0.005)
 
-    completion_token_count = count_tokens(answer)
     stop_reason = "stop"
+
+    real_prompt_tokens = usage.get('save_dict', {}).get('extra_dict', {}).get('num_prompt_tokens')
+    if real_prompt_tokens is not None:
+        token_count = real_prompt_tokens
+    else:
+        token_count = count_tokens(instruction)
+    real_completion_tokens = usage.get('save_dict', {}).get('extra_dict', {}).get('ntokens')
+    if real_completion_tokens is not None:
+        completion_token_count = real_completion_tokens
+    else:
+        completion_token_count = count_tokens(answer)
 
     usage.update({
         "prompt_tokens": token_count,
@@ -475,7 +527,7 @@ def chat_completion_action(body: dict, stream_output=False) -> dict:
         yield resp
 
 
-def completions_action(body: dict, stream_output=False):
+async def acompletions_action(body: dict, stream_output=False):
     object_type = 'text_completion.chunk' if stream_output else 'text_completion'
     created_time = int(time.time())
     res_id = "res_id-%s" % str(uuid.uuid4())
@@ -505,11 +557,18 @@ def completions_action(body: dict, stream_output=False):
             token_count = count_tokens(prompt)
             total_prompt_token_count += token_count
 
-            if use_agent:
-                from openai_server.agent_backend import get_agent_response
-                response, ret = get_last_and_return_value(get_agent_response(prompt, gen_kwargs))
-            else:
-                response, ret = get_last_and_return_value(get_response(prompt, gen_kwargs))
+            generator = get_generator(prompt, gen_kwargs, use_agent=use_agent, stream_output=stream_output)
+            ret = {}
+            response = ""
+            try:
+                async for last_value in generator:
+                    if isinstance(last_value, dict):
+                        ret = last_value
+                    else:
+                        response = last_value
+            except StopIteration:
+                pass
+
             if isinstance(ret, dict):
                 usage.update(ret)
 
@@ -566,26 +625,18 @@ def completions_action(body: dict, stream_output=False):
 
             return chunk
 
-        if use_agent:
-            from openai_server.agent_backend import get_agent_response
-            generator = get_agent_response(prompt, gen_kwargs, chunk_response=stream_output,
-                                           stream_output=stream_output)
-        else:
-            generator = get_response(prompt, gen_kwargs, chunk_response=stream_output,
-                                     stream_output=stream_output)
+        generator = get_generator(prompt, gen_kwargs, use_agent=use_agent, stream_output=stream_output)
 
         response = ''
         usage = {}
-        try:
-            while True:
-                chunk = next(generator)
+        async for chunk in generator:
+            if isinstance(chunk, dict):
+                usage.update(chunk)
+            else:
                 response += chunk
                 yield_chunk = text_streaming_chunk(chunk)
                 yield yield_chunk
-        except StopIteration as e:
-            # Get the return value
-            if isinstance(e.value, dict):
-                usage.update(e.value)
+            await asyncio.sleep(0.005)
 
         completion_token_count = count_tokens(response)
         stop_reason = "stop"
@@ -600,23 +651,13 @@ def completions_action(body: dict, stream_output=False):
         yield chunk
 
 
-def chat_completions(body: dict) -> dict:
-    generator = chat_completion_action(body, stream_output=False)
-    return deque(generator, maxlen=1).pop()
-
-
-def stream_chat_completions(body: dict):
-    for resp in chat_completion_action(body, stream_output=True):
+async def astream_chat_completions(body: dict, stream_output=True):
+    async for resp in achat_completion_action(body, stream_output=stream_output):
         yield resp
 
 
-def completions(body: dict) -> dict:
-    generator = completions_action(body, stream_output=False)
-    return deque(generator, maxlen=1).pop()
-
-
-def stream_completions(body: dict):
-    for resp in completions_action(body, stream_output=True):
+async def astream_completions(body: dict, stream_output=True):
+    async for resp in acompletions_action(body, stream_output=stream_output):
         yield resp
 
 
@@ -666,7 +707,7 @@ def split_audio_fixed_intervals(audio_bytes, interval_ms=10000):
     return chunk_bytes
 
 
-def audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
+async def audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
     if chunk != 'none':
         # break-up audio file
         if chunk == 'silence':
@@ -675,14 +716,14 @@ def audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
             audio_files = split_audio_fixed_intervals(audio_file, interval_ms=chunk)
 
         for audio_file1 in audio_files:
-            for text in _audio_to_text(model, audio_file1, stream, response_format, chunk, **kwargs):
+            async for text in _audio_to_text(model, audio_file1, stream, response_format, chunk, **kwargs):
                 yield text
     else:
-        for text in _audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
+        async for text in _audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
             yield text
 
 
-def _audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
+async def _audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
     # assumes enable_stt=True set for h2oGPT
     if os.getenv('GRADIO_H2OGPT_H2OGPT_KEY') and not kwargs.get('h2ogpt_key'):
         kwargs.update(dict(h2ogpt_key=os.getenv('GRADIO_H2OGPT_H2OGPT_KEY')))
@@ -722,7 +763,7 @@ def _audio_to_text(model, audio_file, stream, response_format, chunk, **kwargs):
         yield dict(text=text.strip())
 
 
-def text_to_audio(model, voice, input, stream, response_format, **kwargs):
+async def text_to_audio(model, voice, input, stream, response_format, **kwargs):
     # tts_model = 'microsoft/speecht5_tts'
     # tts_model = 'tts_models/multilingual/multi-dataset/xtts_v2'
     # assumes enable_tts=True set for h2oGPT
@@ -761,12 +802,14 @@ def text_to_audio(model, voice, input, stream, response_format, **kwargs):
         n = 0
         for audio_str in job:
             yield audio_str_to_bytes(audio_str, response_format=response_format)
+            await asyncio.sleep(0.005)
             n += 1
 
         # get rest after job done
         outputs = job.outputs().copy()
         for audio_str in outputs[n:]:
             yield audio_str_to_bytes(audio_str, response_format=response_format)
+            await asyncio.sleep(0.005)
             n += 1
     else:
         audio_str = client.predict(*tuple(list(inputs.values())), api_name='/speak_text_api')

@@ -15,7 +15,7 @@ def run_eval(  # for local function:
         regenerate_clients=None, regenerate_gradio_clients=None, validate_clients=None, fail_if_invalid_client=None,
         prompt_type=None, prompt_dict=None, chat_template=None, system_prompt=None,
         debug=None, chat=False,
-        stream_output=None, async_output=None, num_async=None, stream_map=None,
+        stream_output=None, enable_caching=None, async_output=None, num_async=None, stream_map=None,
         eval_filename=None, eval_prompts_only_num=None, eval_prompts_only_seed=None, eval_as_output=None,
         examples=None, memory_restriction_level=None,
         # evaluate kwargs
@@ -34,6 +34,10 @@ def run_eval(  # for local function:
         enable_pdf_doctr=None,
         enable_image=None,
         visible_image_models=None,
+        image_size=None,
+        image_quality=None,
+        image_guidance_scale=None,
+        image_num_inference_steps=None,
 
         try_pdf_as_html=None,
         # for evaluate args beyond what's already above, or things that are always dynamic and locally created
@@ -129,6 +133,7 @@ def run_eval(  # for local function:
         guided_choice=None,
         guided_grammar=None,
         guided_whitespace_pattern=None,
+        client_metadata=None,
 
         # for evaluate kwargs:
         captions_model=None,
